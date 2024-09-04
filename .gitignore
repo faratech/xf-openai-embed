@@ -1,0 +1,25 @@
+# Ignore everything
+*
+
+# But not these files...
+!.gitignore
+!README.md
+!LICENSE
+
+# ...and not these specific scripts
+!embed_generate_xf_post.py
+!embed_generate_xf_thread.py
+!faiss_router.py
+!embed-elastic.py
+!embed-vector-search.py
+!embed-faiss-search-with-embed.py
+!ai-search.php
+
+# Even if they are in subdirectories
+!*/
+
+# !/subdirectory/**
+
+# Ignore all Pycache
+__pycache__/
+*.pyc
