@@ -1,6 +1,6 @@
-# FAISS for XenForo
+# OpenAI Embeddings for XenForo Search (with FAISS)
 
-FAISS for XenForo is an advanced search solution in development designed to enhance the search capabilities of XenForo forums. It leverages FAISS (Facebook AI Similarity Search) for efficient semantic similarity search, combined with Elasticsearch for traditional keyword-based search, providing a powerful hybrid search experience.
+OpenAI Embeddings for XenForo Search (with FAISS) is an advanced search solution in development designed to enhance the search capabilities of XenForo forums. It leverages FAISS (Facebook AI Similarity Search) for efficient semantic similarity search, combined with Elasticsearch for traditional keyword-based search, providing a powerful hybrid search experience.
 
 ## What is FAISS?
 
@@ -27,7 +27,7 @@ FAISS (Facebook AI Similarity Search) is a library developed by Facebook Researc
 
 ### Account Requirements
 
-- An OpenAI account with API access (for generating embeddings)
+- An OpenAI account with API access (for generating embeddings) - https://platform.openai.com/docs/guides/embeddings
 
 ### Hardware Requirements
 
