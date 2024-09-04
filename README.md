@@ -1,6 +1,6 @@
 # OpenAI Embeddings for XenForo Search (with FAISS)
 
-OpenAI Embeddings for XenForo Search (with FAISS) is an advanced search solution in development designed to enhance the search capabilities of XenForo forums. It leverages FAISS (Facebook AI Similarity Search) for efficient semantic similarity search, combined with Elasticsearch for traditional keyword-based search, providing a powerful hybrid search experience.
+OpenAI Embeddings for XenForo Search (with FAISS) is an advanced search solution in development designed to enhance the search capabilities of XenForo forums. It leverages FAISS (Facebook AI Similarity Search) for efficient semantic similarity search, combined with Elasticsearch for traditional keyword-based search, providing a powerful hybrid search experience. It utilizes OpenAI embeddings.
 
 ## What is FAISS?
 
