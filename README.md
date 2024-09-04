@@ -1,7 +1,3 @@
-To set up FAISS for XenForo, you can follow these steps. Below is the integration into your `README.md`:
-
----
-
 # FAISS for XenForo
 
 FAISS for XenForo is an advanced search solution in development designed to enhance the search capabilities of XenForo forums. It leverages FAISS (Facebook AI Similarity Search) for efficient semantic similarity search, combined with Elasticsearch for traditional keyword-based search, providing a powerful hybrid search experience.
