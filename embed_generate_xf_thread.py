@@ -1,7 +1,7 @@
 import os
 import asyncio
 import aiomysql
-import numpy as np
+import json
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from tqdm import tqdm
@@ -82,16 +82,16 @@ def count_tokens(text):
 def validate_embedding(embedding):
     if embedding is None:
         return False, "Embedding is None"
-    if isinstance(embedding, bytes):
-        if len(embedding) % 4 != 0:  # Check if byte length is a multiple of 4 (size of float32)
-            return False, f"Invalid buffer size: {len(embedding)} bytes is not a multiple of 4"
-        embedding = np.frombuffer(embedding, dtype=np.float32)
+    if isinstance(embedding, str):
+        # JSON string from VEC_ToText
+        try:
+            embedding = json.loads(embedding)
+        except json.JSONDecodeError:
+            return False, "Invalid JSON format"
+    if not isinstance(embedding, (list, tuple)):
+        return False, f"Invalid type: {type(embedding)}"
     if len(embedding) != EXPECTED_EMBEDDING_LENGTH:
         return False, f"Invalid length: Expected {EXPECTED_EMBEDDING_LENGTH}, got {len(embedding)}"
-    if not np.isfinite(embedding).all():
-        return False, "Embedding contains NaNs or Infinities"
-    if np.max(np.abs(embedding)) > 100:
-        return False, f"Extreme values detected: max abs value = {np.max(np.abs(embedding))}"
     return True, "Valid"
 
 async def process_single_thread(pool, thread_id):
@@ -118,17 +118,18 @@ async def process_single_thread(pool, thread_id):
                 logging.error(f"Invalid embedding for thread ID {thread_id}: {validation_message}")
                 return
 
-            embedding_blob = np.array(embedding, dtype=np.float32).tobytes()
+            # Convert to JSON for VEC_FromText
+            vector_json = '[' + ','.join(str(f) for f in embedding) + ']'
 
             await cursor.execute('''
                 INSERT INTO openai_embeddings
                 (thread_id, embedding, embedding_length, is_truncated, section, last_updated)
-                VALUES (%s, %s, %s, %s, %s, NOW())
+                VALUES (%s, VEC_FromText(%s), %s, %s, %s, NOW())
                 ON DUPLICATE KEY UPDATE
                     embedding = VALUES(embedding),
                     embedding_length = VALUES(embedding_length),
                     is_truncated = VALUES(is_truncated)
-            ''', (thread_id, embedding_blob, len(embedding), tokens > MAX_TOKENS, 0))
+            ''', (thread_id, vector_json, len(embedding), tokens > MAX_TOKENS, 0))
             await conn.commit()
             logging.info(f"Processed thread ID {thread_id}")
 
@@ -144,17 +145,18 @@ async def process_batch_with_semaphore(pool, batch):
                     tokens = count_tokens(thread['title'])
                     is_truncated = tokens > MAX_TOKENS
 
-                    embedding_blob = np.array(embedding, dtype=np.float32).tobytes()
+                    # Convert to JSON for VEC_FromText
+                    vector_json = '[' + ','.join(str(f) for f in embedding) + ']'
 
                     await cursor.execute('''
                         INSERT INTO openai_embeddings
                         (thread_id, embedding, embedding_length, is_truncated, section, last_updated)
-                        VALUES (%s, %s, %s, %s, %s, NOW())
+                        VALUES (%s, VEC_FromText(%s), %s, %s, %s, NOW())
                         ON DUPLICATE KEY UPDATE
                             embedding = VALUES(embedding),
                             embedding_length = VALUES(embedding_length),
                             is_truncated = VALUES(is_truncated)
-                    ''', (thread_id, embedding_blob, len(embedding), is_truncated, 0))
+                    ''', (thread_id, vector_json, len(embedding), is_truncated, 0))
 
                 await conn.commit()
 
@@ -212,20 +214,19 @@ async def check_embeddings(pool):
                 with tqdm(total=total_embeddings, desc="Checking embeddings") as pbar:
                     for offset in range(0, total_embeddings, 100):
                         await cursor.execute(f'''
-                            SELECT thread_id, embedding, embedding_length
+                            SELECT thread_id, VEC_ToText(embedding) AS vec_text, embedding_length
                             FROM openai_embeddings
                             WHERE thread_id IS NOT NULL
                             LIMIT {offset}, 100
                         ''')
                         batch = await cursor.fetchall()
-                        for thread_id, embedding_blob, stored_length in batch:
-                            if embedding_blob is None:
+                        for thread_id, vec_text, stored_length in batch:
+                            if vec_text is None:
                                 logging.warning(f"Embedding is None for thread_id {thread_id}")
                                 issues_count += 1
                                 continue
                             try:
-                                embedding = np.frombuffer(embedding_blob, dtype=np.float32)
-                                is_valid, message = validate_embedding(embedding)
+                                is_valid, message = validate_embedding(vec_text)
                                 if not is_valid or stored_length != EXPECTED_EMBEDDING_LENGTH:
                                     issues_count += 1
                                     logging.warning(f"Issue with thread_id {thread_id}: {message}")
@@ -253,13 +254,14 @@ async def process_repair_batch_with_semaphore(pool, batch):
                     tokens = count_tokens(item['title'])
                     is_truncated = tokens > MAX_TOKENS
 
-                    embedding_blob = np.array(embedding, dtype=np.float32).tobytes()
+                    # Convert to JSON for VEC_FromText
+                    vector_json = '[' + ','.join(str(f) for f in embedding) + ']'
 
                     await cursor.execute('''
                         UPDATE openai_embeddings
-                        SET embedding = %s, embedding_length = %s, is_truncated = %s, last_updated = NOW()
+                        SET embedding = VEC_FromText(%s), embedding_length = %s, is_truncated = %s, last_updated = NOW()
                         WHERE thread_id = %s
-                    ''', (embedding_blob, len(embedding), is_truncated, thread_id))
+                    ''', (vector_json, len(embedding), is_truncated, thread_id))
 
                 await conn.commit()
 
@@ -275,15 +277,15 @@ async def repair_embeddings(pool):
                 with tqdm(total=total_embeddings, desc="Repairing embeddings") as pbar:
                     for offset in range(0, total_embeddings, BATCH_SIZE * MAX_CONCURRENT_REQUESTS):
                         await cursor.execute(f'''
-                            SELECT openai_embeddings.thread_id, embedding, embedding_length, title
+                            SELECT openai_embeddings.thread_id, VEC_ToText(embedding) AS vec_text, embedding_length, title
                             FROM openai_embeddings
                             JOIN xf_thread ON openai_embeddings.thread_id = xf_thread.thread_id
                             LIMIT {offset}, {BATCH_SIZE * MAX_CONCURRENT_REQUESTS}
                         ''')
                         batch = await cursor.fetchall()
                         batch_to_repair = []
-                        for thread_id, embedding_blob, stored_length, title in batch:
-                            is_valid, validation_message = validate_embedding(embedding_blob)
+                        for thread_id, vec_text, stored_length, title in batch:
+                            is_valid, validation_message = validate_embedding(vec_text)
                             if not is_valid or stored_length != EXPECTED_EMBEDDING_LENGTH:
                                 logging.warning(f"Invalid embedding for thread_id {thread_id}: {validation_message}")
                                 tokens = count_tokens(title)

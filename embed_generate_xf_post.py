@@ -1,7 +1,7 @@
 import os
 import asyncio
 import aiomysql
-import numpy as np
+import json
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from tqdm import tqdm
@@ -25,7 +25,7 @@ tokenizer = tiktoken.encoding_for_model("text-embedding-3-small")
 # Constants
 MAX_TOKENS = 8191
 EXPECTED_EMBEDDING_LENGTH = 1536
-BATCH_SIZE = 2048
+BATCH_SIZE = 50  # Reduced to stay under 300k token limit per API request
 MAX_CONCURRENT_REQUESTS = 10  # Adjust this based on your rate limits and system capabilities
 
 # Create a semaphore to limit concurrent requests
@@ -82,16 +82,16 @@ def count_tokens(text):
 def validate_embedding(embedding):
     if embedding is None:
         return False, "Embedding is None"
-    if isinstance(embedding, bytes):
-        if len(embedding) % 4 != 0:  # Check if byte length is a multiple of 4 (size of float32)
-            return False, f"Invalid buffer size: {len(embedding)} bytes is not a multiple of 4"
-        embedding = np.frombuffer(embedding, dtype=np.float32)
+    if isinstance(embedding, str):
+        # JSON string from VEC_ToText
+        try:
+            embedding = json.loads(embedding)
+        except json.JSONDecodeError:
+            return False, "Invalid JSON format"
+    if not isinstance(embedding, (list, tuple)):
+        return False, f"Invalid type: {type(embedding)}"
     if len(embedding) != EXPECTED_EMBEDDING_LENGTH:
         return False, f"Invalid length: Expected {EXPECTED_EMBEDDING_LENGTH}, got {len(embedding)}"
-    if not np.isfinite(embedding).all():
-        return False, "Embedding contains NaNs or Infinities"
-    if np.max(np.abs(embedding)) > 100:
-        return False, f"Extreme values detected: max abs value = {np.max(np.abs(embedding))}"
     return True, "Valid"
 
 async def process_single_post(pool, post_id):
@@ -118,23 +118,32 @@ async def process_single_post(pool, post_id):
                 logging.error(f"Invalid embedding for post ID {post_id}: {validation_message}")
                 return
 
-            embedding_blob = np.array(embedding, dtype=np.float32).tobytes()
+            # Convert to JSON for VEC_FromText
+            vector_json = '[' + ','.join(str(f) for f in embedding) + ']'
 
             await cursor.execute('''
                 INSERT INTO openai_embeddings
                 (post_id, embedding, embedding_length, is_truncated, section, last_updated)
-                VALUES (%s, %s, %s, %s, %s, NOW())
+                VALUES (%s, VEC_FromText(%s), %s, %s, %s, NOW())
                 ON DUPLICATE KEY UPDATE
                     embedding = VALUES(embedding),
                     embedding_length = VALUES(embedding_length),
                     is_truncated = VALUES(is_truncated)
-            ''', (post_id, embedding_blob, len(embedding), tokens > MAX_TOKENS, 0))
+            ''', (post_id, vector_json, len(embedding), tokens > MAX_TOKENS, 0))
             await conn.commit()
             logging.info(f"Processed post ID {post_id}")
 
+def truncate_text(text):
+    """Truncate text to MAX_TOKENS if needed"""
+    tokens = tokenizer.encode(text)
+    if len(tokens) > MAX_TOKENS:
+        return tokenizer.decode(tokens[:MAX_TOKENS])
+    return text
+
 async def process_batch_with_semaphore(pool, batch):
     async with semaphore:
-        texts = [post['message'] for post in batch]
+        # Truncate texts before sending to API to avoid token limit errors
+        texts = [truncate_text(post['message']) for post in batch]
         embeddings = await get_embedding_batch(texts)
 
         async with pool.acquire() as conn:
@@ -144,17 +153,18 @@ async def process_batch_with_semaphore(pool, batch):
                     tokens = count_tokens(post['message'])
                     is_truncated = tokens > MAX_TOKENS
 
-                    embedding_blob = np.array(embedding, dtype=np.float32).tobytes()
+                    # Convert to JSON for VEC_FromText
+                    vector_json = '[' + ','.join(str(f) for f in embedding) + ']'
 
                     await cursor.execute('''
                         INSERT INTO openai_embeddings
                         (post_id, embedding, embedding_length, is_truncated, section, last_updated)
-                        VALUES (%s, %s, %s, %s, %s, NOW())
+                        VALUES (%s, VEC_FromText(%s), %s, %s, %s, NOW())
                         ON DUPLICATE KEY UPDATE
                             embedding = VALUES(embedding),
                             embedding_length = VALUES(embedding_length),
                             is_truncated = VALUES(is_truncated)
-                    ''', (post_id, embedding_blob, len(embedding), is_truncated, 0))
+                    ''', (post_id, vector_json, len(embedding), is_truncated, 0))
 
                 await conn.commit()
 
@@ -212,19 +222,18 @@ async def check_embeddings(pool):
                 with tqdm(total=total_embeddings, desc="Checking embeddings") as pbar:
                     for offset in range(0, total_embeddings, 100):
                         await cursor.execute(f'''
-                            SELECT post_id, embedding, embedding_length
+                            SELECT post_id, VEC_ToText(embedding) AS vec_text, embedding_length
                             FROM openai_embeddings
                             LIMIT {offset}, 100
                         ''')
                         batch = await cursor.fetchall()
-                        for post_id, embedding_blob, stored_length in batch:
-                            if embedding_blob is None:
+                        for post_id, vec_text, stored_length in batch:
+                            if vec_text is None:
                                 logging.warning(f"Embedding is None for post_id {post_id}")
                                 issues_count += 1
                                 continue
                             try:
-                                embedding = np.frombuffer(embedding_blob, dtype=np.float32)
-                                is_valid, message = validate_embedding(embedding)
+                                is_valid, message = validate_embedding(vec_text)
                                 if not is_valid or stored_length != EXPECTED_EMBEDDING_LENGTH:
                                     issues_count += 1
                                     logging.warning(f"Issue with post_id {post_id}: {message}")
@@ -252,16 +261,17 @@ async def process_repair_batch_with_semaphore(pool, batch):
                     tokens = count_tokens(item['message'])
                     is_truncated = tokens > MAX_TOKENS
 
-                    embedding_blob = np.array(embedding, dtype=np.float32).tobytes()
+                    # Convert to JSON for VEC_FromText
+                    vector_json = '[' + ','.join(str(f) for f in embedding) + ']'
 
                     await cursor.execute('''
                         UPDATE openai_embeddings
-                        SET embedding = %s, embedding_length = %s, is_truncated = %s, last_updated = NOW()
+                        SET embedding = VEC_FromText(%s), embedding_length = %s, is_truncated = %s, last_updated = NOW()
                         WHERE post_id = %s
-                    ''', (embedding_blob, len(embedding), is_truncated, post_id))
-                
+                    ''', (vector_json, len(embedding), is_truncated, post_id))
+
                 await conn.commit()
-        
+
         logging.info(f"Processed repair batch of {len(batch)} posts")
 
 async def repair_embeddings(pool):
@@ -274,15 +284,15 @@ async def repair_embeddings(pool):
                 with tqdm(total=total_embeddings, desc="Repairing embeddings") as pbar:
                     for offset in range(0, total_embeddings, BATCH_SIZE * MAX_CONCURRENT_REQUESTS):
                         await cursor.execute(f'''
-                            SELECT openai_embeddings.post_id, embedding, embedding_length, message
+                            SELECT openai_embeddings.post_id, VEC_ToText(embedding) AS vec_text, embedding_length, message
                             FROM openai_embeddings
                             JOIN xf_post ON openai_embeddings.post_id = xf_post.post_id
                             LIMIT {offset}, {BATCH_SIZE * MAX_CONCURRENT_REQUESTS}
                         ''')
                         batch = await cursor.fetchall()
                         batch_to_repair = []
-                        for post_id, embedding_blob, stored_length, message in batch:
-                            is_valid, validation_message = validate_embedding(embedding_blob)
+                        for post_id, vec_text, stored_length, message in batch:
+                            is_valid, validation_message = validate_embedding(vec_text)
                             if not is_valid or stored_length != EXPECTED_EMBEDDING_LENGTH:
                                 logging.warning(f"Invalid embedding for post_id {post_id}: {validation_message}")
                                 tokens = count_tokens(message)
@@ -290,14 +300,14 @@ async def repair_embeddings(pool):
                                     message = tokenizer.decode(tokenizer.encode(message)[:MAX_TOKENS])
                                 batch_to_repair.append({'post_id': post_id, 'message': message})
                                 repaired_count += 1
-                        
+
                         if batch_to_repair:
                             repair_batches = [batch_to_repair[i:i + BATCH_SIZE] for i in range(0, len(batch_to_repair), BATCH_SIZE)]
                             tasks = [process_repair_batch_with_semaphore(pool, repair_batch) for repair_batch in repair_batches]
                             await asyncio.gather(*tasks)
-                        
+
                         pbar.update(len(batch))
-                
+
                 logging.info(f"Repaired {repaired_count} embeddings out of {total_embeddings} total.")
     except Exception as e:
         logging.error(f"An error occurred during repair: {e}")
