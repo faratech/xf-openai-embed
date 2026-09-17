@@ -1,85 +1,27 @@
 #!/usr/bin/env python3
 """
-Vector similarity search using MariaDB native VECTOR functions.
-
-Uses VEC_DISTANCE() for in-database cosine similarity - no need to load
-all embeddings into RAM.
+embed-vector-search.py: Vector similarity search using MariaDB native VECTOR functions.
+Uses VEC_DISTANCE_COSINE() for in-database cosine similarity search.
 """
 
-import os
 import sys
-import json
-import openai
-import mysql.connector
-from dotenv import load_dotenv
-
-# Load environment
-load_dotenv('/web/.env')
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
-MYSQL_HOST = os.getenv("MYSQL_HOST")
-MYSQL_PORT = int(os.getenv("MYSQL_PORT", 3306))
-MYSQL_USER = os.getenv("MYSQL_USER")
-MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD")
-MYSQL_DATABASE = os.getenv("MYSQL_DATABASE")
+import os
+import asyncio
+from xf_embed.config import settings
+from xf_embed.embeddings import generate_embedding
+from xf_embed.db import get_db_pool, close_db_pool, search_mariadb_native_vector
 
 
-def get_embedding(text: str, model: str = "text-embedding-3-small") -> list:
-    """Get embedding from OpenAI."""
-    response = openai.embeddings.create(input=[text], model=model)
-    return response.data[0].embedding
-
-
-def find_similar_posts(query: str, top_n: int = 10):
-    """
-    Find similar posts using MariaDB native vector distance.
-
-    Uses VEC_DISTANCE with cosine similarity directly in SQL -
-    much faster than loading all vectors into Python.
-    """
-    # Get query embedding
-    print(f"Generating embedding for: {query}")
-    query_embedding = get_embedding(query)
-
-    # Convert to JSON for VEC_FromText
-    query_vector_json = '[' + ','.join(str(f) for f in query_embedding) + ']'
-
-    conn = mysql.connector.connect(
-        host=MYSQL_HOST,
-        port=MYSQL_PORT,
-        user=MYSQL_USER,
-        password=MYSQL_PASSWORD,
-        database=MYSQL_DATABASE,
-        charset='utf8mb4',
-        collation='utf8mb4_unicode_ci'
-    )
-    cursor = conn.cursor()
-
-    # Use VEC_DISTANCE for in-database similarity search
-    # cosine distance = 1 - cosine_similarity, so lower is better
-    query = """
-        SELECT
-            e.post_id,
-            e.thread_id,
-            p.message,
-            t.title,
-            VEC_DISTANCE(e.embedding, VEC_FromText(%s)) AS distance
-        FROM openai_embeddings e
-        LEFT JOIN xf_post p ON e.post_id = p.post_id
-        LEFT JOIN xf_thread t ON e.thread_id = t.thread_id
-        WHERE e.embedding IS NOT NULL
-          AND e.post_id IS NOT NULL
-        ORDER BY distance ASC
-        LIMIT %s
-    """
-
-    cursor.execute(query, (query_vector_json, top_n))
-    results = cursor.fetchall()
-
-    cursor.close()
-    conn.close()
-
-    return results
+async def run_search(query: str, top_n: int = 10):
+    print(f"Generating embedding for query: '{query}'...")
+    pool = await get_db_pool()
+    try:
+        vec = await generate_embedding(query)
+        print(f"Searching MariaDB native vector database (top {top_n})...")
+        results = await search_mariadb_native_vector(pool, vec, top_k=top_n)
+        return results
+    finally:
+        await close_db_pool()
 
 
 def main():
@@ -91,18 +33,18 @@ def main():
     query = sys.argv[1]
     top_n = int(sys.argv[2]) if len(sys.argv) > 2 else 10
 
-    results = find_similar_posts(query, top_n)
+    results = asyncio.run(run_search(query, top_n))
 
-    print(f"\nTop {len(results)} similar posts (lower distance = more similar):\n")
+    print(f"\nTop {len(results)} similar posts/threads:\n")
     print("-" * 80)
 
-    for post_id, thread_id, message, title, distance in results:
-        similarity = 1 - distance  # Convert distance to similarity
-        title_preview = (title[:60] + '...') if title and len(title) > 60 else (title or 'N/A')
-        msg_preview = (message[:100] + '...') if message and len(message) > 100 else (message or 'N/A')
-        msg_preview = msg_preview.replace('\n', ' ')
+    for r in results:
+        title = r.get("thread_title") or "N/A"
+        msg = r.get("message") or "N/A"
+        title_preview = (title[:60] + "...") if len(title) > 60 else title
+        msg_preview = (msg[:100] + "...").replace("\n", " ") if len(msg) > 100 else msg.replace("\n", " ")
 
-        print(f"Post ID: {post_id} | Thread: {thread_id} | Similarity: {similarity:.4f}")
+        print(f"Type: {r.get('type')} | Post ID: {r.get('post_id')} | Thread ID: {r.get('thread_id')} | Similarity: {r.get('score', 0.0):.4f}")
         print(f"Title: {title_preview}")
         print(f"Message: {msg_preview}")
         print("-" * 80)

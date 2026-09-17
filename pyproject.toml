@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xf-openai-embed"
+version = "0.2.0"
+description = "Modern Semantic and Hybrid Search for XenForo forums using OpenAI embeddings, FAISS, and Elasticsearch"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Mike Fara", email = "mjfara@gmail.com"}
+]
+keywords = ["xenforo", "search", "embeddings", "faiss", "elasticsearch", "hybrid-search", "fastapi"]
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.28.0",
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.2.0",
+    "openai>=1.30.0",
+    "faiss-cpu>=1.8.0",
+    "elasticsearch>=8.13.0",
+    "aiomysql>=0.2.0",
+    "pymysql>=1.1.0",
+    "numpy>=1.26.0",
+    "tiktoken>=0.7.0",
+    "tenacity>=8.3.0",
+    "python-dotenv>=1.0.0",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+cli = [
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "httpx>=0.27.0",
+]
+
+[project.scripts]
+xf-search = "xf_embed.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["xf_embed*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

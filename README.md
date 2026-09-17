@@ -1,145 +1,238 @@
-# OpenAI Embeddings for XenForo Search (with FAISS)
+# OpenAI Embeddings & Hybrid Search for XenForo (with FAISS & Elasticsearch)
 
-OpenAI Embeddings for XenForo Search (with FAISS) is an advanced search solution in development designed to enhance the search capabilities of XenForo forums. It leverages FAISS (Facebook AI Similarity Search) for efficient semantic similarity search, combined with Elasticsearch for traditional keyword-based search, providing a powerful hybrid search experience. It utilizes OpenAI embeddings.
+Modern, high-performance semantic and hybrid search solution for XenForo forums. Combines **OpenAI embeddings** (`text-embedding-3-small`), **FAISS** vector similarity search (with `IndexIDMap2` and HNSW/Cosine support), and **Elasticsearch** (BM25 keyword search) using **Reciprocal Rank Fusion (RRF)**.
 
-## What is FAISS?
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 
-FAISS (Facebook AI Similarity Search) is a library developed by Facebook Research that enables efficient similarity search and clustering of dense vectors. In this project, FAISS is used to perform fast and accurate semantic searches based on vector representations (embeddings) of forum posts and thread titles.
+---
 
-## Components
+## Key Features & Modernizations
 
-1. **FAISS Router** (`faiss_router.py`): Handles API routes for search operations.
-2. **Embedding Generator** (`embed_generate_xf_post.py` and `embed_generate_xf_thread.py`): Generates embeddings for forum posts and thread titles.
-3. **Elasticsearch Indexer** (`embed-elastic.py`): Indexes forum data into Elasticsearch.
-4. **Vector Search** (`embed-vector-search.py`): Performs vector similarity search using FAISS.
-5. **Combined Search** (`embed-faiss-search-with-embed.py`): Implements the hybrid search combining FAISS and Elasticsearch results.
+- **True Hybrid Search (RRF)**: Merges semantic vector hits with Elasticsearch BM25 keywords via Reciprocal Rank Fusion ($k=60$) or weighted score fusion, replacing legacy sort-by-date logic.
+- **High-Throughput FAISS Indexing**: Uses `IndexIDMap2` with unit-normalized Inner Product (exact cosine similarity). Streams millions of rows from MySQL in batches without exhausting memory.
+- **FastAPI Modern Async Service**: Fully async backend powered by `aiomysql`, `AsyncElasticsearch`, and `AsyncOpenAI`. Includes automatic OpenAPI Swagger documentation (`/docs`) and `/health` monitoring.
+- **High-Speed Elasticsearch Bulk Indexing**: Ingests hundreds of thousands of documents via `elasticsearch.helpers.async_bulk` (50–100x faster than legacy single-document calls).
+- **MariaDB 12 Vector Search Backend**: Optional zero-RAM alternative using MariaDB 12 native `VEC_DISTANCE_COSINE()` queries.
+- **Interactive CLI (`xf-search`)**: Built with Typer and Rich for easy server management, index generation, terminal search queries, and latency benchmarking.
+- **Automated Test Suite**: Full `pytest` unit and integration test coverage.
+
+---
+
+## Architecture Overview
+
+```mermaid
+flowchart TD
+    subgraph Client["Clients"]
+        PHP["ai-search.php (Web UI)"]
+        XF["XenForo Add-on / REST API"]
+        CLI["xf-search CLI"]
+    end
+
+    subgraph API["FastAPI Modern Service (xf_embed.api)"]
+        Router["FastAPI App (Lifespan + CORS + Swagger)"]
+        HybridEngine["Hybrid Search Engine (RRF / Weighted Fusion)"]
+        VectorService["Vector Search Engine"]
+        ESService["Elasticsearch Async Service"]
+    end
+
+    subgraph Storage["Data & Index Stores"]
+        MariaDB[("MariaDB 12 (xf_post, xf_thread, openai_embeddings)")]
+        FAISS["FAISS Index (IndexIDMap2 + Cosine/HNSW)"]
+        ES[("Elasticsearch 9.x (wf_wf / BM25)")]
+    end
+
+    PHP -->|HTTP POST| Router
+    XF -->|HTTP POST| Router
+    CLI -->|Command| HybridEngine
+
+    Router --> HybridEngine
+    HybridEngine -->|asyncio.gather| VectorService
+    HybridEngine -->|asyncio.gather| ESService
+
+    VectorService -->|In-memory / MMap| FAISS
+    VectorService -.->|Alternative backend| MariaDB
+    ESService --> ES
+```
+
+---
 
 ## Requirements
 
-### Software Requirements
+- **Python**: 3.10+ (tested on Python 3.10 – 3.14)
+- **Database**: MySQL 8.0+ or MariaDB 11.7+ / 12.x
+- **Search Engine**: Elasticsearch 7.x, 8.x, or 9.x (XenForo Enhanced Search compatible)
+- **OpenAI Account**: API key with access to `text-embedding-3-small` (or `text-embedding-3-large`)
 
-- Python 3.7 or higher
-- XenForo and XenForo Enhanced Search add-on
-- MySQL server (5.7+ or 8.0+)
-- Elasticsearch server (7.x or higher)
-- Git (for cloning the repository)
-- FastAPI
-
-### Account Requirements
-
-- An OpenAI account with API access (for generating embeddings) - https://platform.openai.com/docs/guides/embeddings
-
-### Hardware Requirements
-
-- At least 8GB of RAM (16GB or more recommended for larger forums)
-- Sufficient storage space for the database and index files (depends on forum size)
-
-### Python Libraries
-
-- FastAPI
-- uvicorn
-- aiomysql
-- numpy
-- faiss-cpu (or faiss-gpu for GPU support)
-- openai
-- python-dotenv
-- elasticsearch
-- tqdm
-- tiktoken
-- tenacity
-
-## Prerequisites
-
-Before installing FAISS for XenForo, ensure you have:
-
-1. Set up and configured your XenForo forum.
-2. Installed and configured MySQL server.
-3. Installed and configured Elasticsearch server.
-4. Obtained an OpenAI API key.
-5. Set up FastAPI with web access.
-6. Installed Python 3.7+ on your system.
+---
 
 ## Installation
 
 1. **Clone the repository**:
-
    ```bash
    git clone https://github.com/your-repo/xf-openai-embed.git
    cd xf-openai-embed
    ```
 
-2. **Set up the environment**:
-
-   Create a `.env` file in the root directory and add the following content:
-
+2. **Install dependencies**:
    ```bash
-   OPENAI_API_KEY=your_openai_api_key
-   MYSQL_HOST=your_mysql_host
+   pip install -r requirements.txt
+   # Or install editable CLI tool:
+   pip install -e .
+   ```
+
+3. **Configure environment variables**:
+   Create a `.env` file in the root directory (or use `/web/.env`):
+   ```env
+   # Database
+   MYSQL_HOST=127.0.0.1
    MYSQL_PORT=3306
    MYSQL_USER=your_mysql_user
    MYSQL_PASSWORD=your_mysql_password
    MYSQL_DATABASE=your_xenforo_database
+
+   # Elasticsearch
    ELASTICSEARCH_HOST=http://localhost:9200
+   ELASTICSEARCH_USER=
+   ELASTICSEARCH_PASSWORD=
+   ELASTICSEARCH_INDEX=wf_wf
+
+   # OpenAI
+   OPENAI_API_KEY=sk-...
+   OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+   OPENAI_DIMENSIONS=1536
+
+   # Vector Search Backend ('faiss' or 'mariadb')
+   VECTOR_BACKEND=faiss
+   FAISS_INDEX_PATH=faiss_index.bin
+   FAISS_INDEX_TYPE=flat
+   FAISS_METRIC=cosine
    ```
 
-3. **Install the required Python packages**:
+---
 
-   ```bash
-   pip install -r requirements.txt
-   ```
+## Quick Start & CLI Usage
 
-4. **Create the database tables**:
+The `xf-search` command-line tool provides full control:
 
-   Run the `create_tables.py` script to create the necessary tables in your MySQL database:
+### 1. Build the FAISS Vector Index
+Streams vectors from MySQL in batches and saves the index to disk:
+```bash
+xf-search index-faiss --batch-size 10000
+```
 
-   ```bash
-   python create_tables.py
-   ```
+### 2. Start the API Server
+Starts FastAPI with Uvicorn:
+```bash
+xf-search serve --port 8000
+# Or using standard Uvicorn:
+uvicorn faiss_router:app --host 0.0.0.0 --port 8000 --reload
+```
+- Interactive API Documentation (Swagger UI): `http://localhost:8000/docs`
+- Health Check: `http://localhost:8000/health`
 
-5. **Run the embedding generators**:
+### 3. Test Search from Terminal
+```bash
+# True Hybrid Search (RRF)
+xf-search search "windows 11 installation issue" --mode hybrid --limit 5
 
-   To generate embeddings for XenForo posts and threads, run the following scripts:
+# Keyword BM25 Only
+xf-search search "blue screen error" --mode elastic --limit 5
 
-   - For posts: `embed_generate_xf_post.py`
-   - For threads: `embed_generate_xf_thread.py`
+# Semantic Vector Only
+xf-search search "slow boot times after update" --mode vector --limit 5
+```
 
-   ```bash
-   python embed_generate_xf_post.py
-   python embed_generate_xf_thread.py
-   ```
+### 4. Benchmark Search Latency
+```bash
+xf-search benchmark --query "memory leak" --iterations 15
+```
 
-6. **Start the FAISS API**:
+---
 
-   Run the FAISS API using FastAPI and uvicorn:
+## API Endpoints
 
-   ```bash
-   uvicorn faiss_router:app --reload
-   ```
+### 1. Hybrid Search (RRF)
+`POST /faiss/combined/`
+```json
+{
+  "query": "how to reset network settings",
+  "max_results": 10
+}
+```
+**Response:**
+```json
+{
+  "combined_results": [
+    {
+      "type": "post",
+      "post_id": 841203,
+      "thread_id": 321900,
+      "thread_title": "Network Reset Instructions",
+      "message": "To reset your TCP/IP stack...",
+      "post_date": 1720000000,
+      "score": 0.0325,
+      "ranks": { "vector": 1, "elastic": 2 }
+    }
+  ],
+  "count": 1,
+  "query": "how to reset network settings",
+  "algorithm": "rrf"
+}
+```
 
-7. **Access the search interface**:
+### 2. Semantic Vector Search
+`POST /faiss/search/`
+```json
+{
+  "query": "audio crackling windows 11",
+  "max_results": 10
+}
+```
 
-   You can now access the FAISS-powered search interface at:
+### 3. Keyword BM25 Search
+`POST /faiss/elastic/`
+```json
+{
+  "query": "error 0x80070005",
+  "max_results": 10
+}
+```
 
-   ```bash
-   http://localhost:8000/faiss/search
-   ```
+---
 
-## Environmental Variables
+## Standalone Scripts (Backward-Compatible)
 
-This project requires several environmental variables to be set for proper operation. Here's a list of the required environmental variables:
+Existing cron jobs and external scripts continue to function:
+- `python embed_generate_xf_post.py`: Generates missing post embeddings in batches.
+- `python embed_generate_xf_thread.py`: Generates missing thread title embeddings.
+- `python embed-elastic.py --overwrite`: Bulk indexes embeddings into Elasticsearch.
+- `python embed-vector-search.py '<query>'`: Quick CLI search via MariaDB native vector distance.
+- `python embed-faiss-search.py '<query>'`: Standalone FAISS vector query.
+- `python embed-faiss-search-with-embed.py '<query>'`: Standalone RRF hybrid search.
 
-- **OPENAI_API_KEY**: Your OpenAI API key for generating embeddings
-- **MYSQL_HOST**: The hostname of your MySQL server
-- **MYSQL_PORT**: The port number of your MySQL server
-- **MYSQL_USER**: The username for accessing your MySQL database
-- **MYSQL_PASSWORD**: The password for the MySQL user
-- **MYSQL_DATABASE**: The name of your XenForo database
-- **ELASTICSEARCH_HOST**: The URL of your Elasticsearch server
+---
+
+## Web Interface (`ai-search.php`)
+
+An interactive PHP frontend is included at `ai-search.php`. It supports:
+- Switching between **Hybrid (RRF)**, **Semantic Vector**, and **Keyword (BM25)** modes.
+- Light and dark themes with persistent preference storage.
+- Real-time score badges and metadata display.
+- Side-by-side formatted search results and raw JSON inspect panel.
+
+---
+
+## Running Automated Tests
+
+```bash
+pytest -v tests/
+```
+
+---
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT License - see the [LICENSE](LICENSE) file for details.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-
-© 2024 Mike Fara, Fara Technologies LLC
+© 2024–2026 Mike Fara, Fara Technologies LLC

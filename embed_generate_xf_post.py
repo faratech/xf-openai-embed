@@ -11,10 +11,13 @@ import argparse
 from tenacity import retry, wait_random_exponential, stop_after_attempt
 
 # Load environment variables
-load_dotenv('/web/.env')
+from xf_embed.config import settings
+load_dotenv('.env')
+if os.path.exists('/web/.env'):
+    load_dotenv('/web/.env')
 
 # Initialize AsyncOpenAI with the API key
-openai = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+openai = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
