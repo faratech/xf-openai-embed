@@ -7,6 +7,14 @@ import tiktoken
 from openai import AsyncOpenAI
 from tenacity import retry, stop_after_attempt, wait_random_exponential
 
+try:
+    import sys as _sys
+    if "/web/fastapi_app" not in _sys.path:
+        _sys.path.append("/web/fastapi_app")
+    import direct_metering  # ledger row per direct OpenAI call; never load-bearing
+except Exception:
+    direct_metering = None
+
 from xf_embed.cache import cache_query_vector, get_cached_query_vector
 from xf_embed.config import settings
 
@@ -114,6 +122,9 @@ async def _generate_via_openai_api(text: str, model: Optional[str] = None) -> np
         model=target_model,
         dimensions=settings.OPENAI_DIMENSIONS if "3-" in target_model else None,
     )
+    if direct_metering is not None:
+        direct_metering.fire(direct_metering.meter_embedding(
+            response, model=target_model, request_source="xf_embed:fallback"))
     return np.array(response.data[0].embedding, dtype=np.float32)
 
 
@@ -170,6 +181,9 @@ async def generate_embeddings_batch(
         model=target_model,
         dimensions=settings.OPENAI_DIMENSIONS if "3-" in target_model else None,
     )
+    if direct_metering is not None:
+        direct_metering.fire(direct_metering.meter_embedding(
+            response, model=target_model, request_source="xf_embed:fallback", n_inputs=len(safe_texts)))
     embeddings = [data.embedding for data in response.data]
     vecs = np.array(embeddings, dtype=np.float32)
     return normalize_vector(vecs) if normalize else vecs
