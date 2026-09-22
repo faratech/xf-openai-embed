@@ -1,22 +1,22 @@
 import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
-import aiomysql
+import asyncmy.cursors
 import numpy as np
 
 from xf_embed.config import settings
 
 logger = logging.getLogger(__name__)
 
-_pool: Optional[aiomysql.Pool] = None
+_pool: Optional[asyncmy.Pool] = None
 
 
-async def get_db_pool() -> aiomysql.Pool:
+async def get_db_pool() -> asyncmy.Pool:
     """Get or create the global aiomysql connection pool."""
     global _pool
     if _pool is None:
         logger.info("Initializing aiomysql database connection pool...")
-        _pool = await aiomysql.create_pool(
+        _pool = await asyncmy.create_pool(
             host=settings.MYSQL_HOST,
             port=settings.MYSQL_PORT,
             user=settings.MYSQL_USER,
@@ -44,7 +44,7 @@ async def close_db_pool() -> None:
 
 
 async def fetch_embeddings_batch(
-    pool: aiomysql.Pool,
+    pool: asyncmy.Pool,
     last_id: int = 0,
     batch_size: int = 10000,
 ) -> Tuple[List[int], List[Optional[int]], List[Optional[int]], np.ndarray, int]:
@@ -102,7 +102,7 @@ async def fetch_embeddings_batch(
 
 
 async def fetch_details_for_posts_and_threads(
-    pool: aiomysql.Pool,
+    pool: asyncmy.Pool,
     items: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     """
@@ -119,7 +119,7 @@ async def fetch_details_for_posts_and_threads(
     thread_map: Dict[int, Dict[str, Any]] = {}
 
     async with pool.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cursor:
+        async with conn.cursor(asyncmy.cursors.DictCursor) as cursor:
             if post_ids:
                 format_strings = ",".join(["%s"] * len(post_ids))
                 post_query = f"""
@@ -189,7 +189,7 @@ async def fetch_details_for_posts_and_threads(
 
 
 async def fetch_details_by_record_ids(
-    pool: aiomysql.Pool,
+    pool: asyncmy.Pool,
     record_ids: List[int],
 ) -> Dict[int, Dict[str, Any]]:
     """
@@ -218,7 +218,7 @@ async def fetch_details_by_record_ids(
 
     results = {}
     async with pool.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cursor:
+        async with conn.cursor(asyncmy.cursors.DictCursor) as cursor:
             await cursor.execute(query, record_ids)
             rows = await cursor.fetchall()
             for r in rows:
@@ -229,7 +229,7 @@ async def fetch_details_by_record_ids(
 
 
 async def search_mariadb_native_vector(
-    pool: aiomysql.Pool,
+    pool: asyncmy.Pool,
     query_embedding: np.ndarray,
     top_k: int = 10,
 ) -> List[Dict[str, Any]]:
@@ -258,7 +258,7 @@ async def search_mariadb_native_vector(
     """
 
     async with pool.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cursor:
+        async with conn.cursor(asyncmy.cursors.DictCursor) as cursor:
             await cursor.execute(query, (vector_json, top_k))
             rows = await cursor.fetchall()
 

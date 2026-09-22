@@ -1,6 +1,6 @@
 import os
 import asyncio
-import aiomysql
+import asyncmy.cursors
 import json
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -54,7 +54,7 @@ async def get_embedding_batch(texts: list[str], model="text-embedding-3-small") 
 async def get_db_pool():
     logging.info("Attempting to create database connection pool")
     try:
-        pool = await aiomysql.create_pool(
+        pool = await asyncmy.create_pool(
             host=os.getenv("MYSQL_HOST"),
             port=int(os.getenv("MYSQL_PORT")),
             user=os.getenv("MYSQL_USER"),
