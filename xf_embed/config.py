@@ -11,7 +11,7 @@ _env_file = str(_local_env) if _local_env.is_file() else (str(_web_env) if _web_
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=_env_file,
+        env_file=(_env_file, "/web/.config"),
         env_file_encoding="utf-8",
         extra="ignore"
     )

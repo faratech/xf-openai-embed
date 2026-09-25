@@ -15,6 +15,7 @@ from xf_embed.config import settings
 load_dotenv('.env')
 if os.path.exists('/web/.env'):
     load_dotenv('/web/.env')
+    load_dotenv('/web/.config')
 
 # Initialize AsyncOpenAI with the API key
 openai = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
