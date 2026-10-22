@@ -18,19 +18,46 @@ if os.path.exists('/web/.env'):
     load_dotenv('/web/.env')
     load_dotenv('/web/.config')
 
-# Initialize AsyncOpenAI with the API key
-# Tenacity is the only retry layer; SDK retries would multiply each attempt.
-openai = AsyncOpenAI(api_key=settings.OPENAI_API_KEY, max_retries=0)
+# Database-only checks and --help must not require paid API credentials.
+openai = None
+
+
+def get_openai_client():
+    global openai
+    if openai is None:
+        # Tenacity owns retries; SDK retries would multiply each attempt.
+        openai = AsyncOpenAI(
+            api_key=settings.OPENAI_API_KEY,
+            timeout=settings.OPENAI_REQUEST_TIMEOUT,
+            max_retries=0,
+        )
+    return openai
+
+
+async def close_openai_client():
+    global openai
+    client, openai = openai, None
+    if client is not None:
+        await client.close()
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Initialize tokenizer for the specific model
-tokenizer = tiktoken.encoding_for_model("text-embedding-3-small")
+tokenizer = None
+
+
+def get_tokenizer():
+    global tokenizer
+    if tokenizer is None:
+        try:
+            tokenizer = tiktoken.encoding_for_model(settings.OPENAI_EMBEDDING_MODEL)
+        except KeyError:
+            tokenizer = tiktoken.get_encoding("cl100k_base")
+    return tokenizer
 
 # Constants
 MAX_TOKENS = 8191
-EXPECTED_EMBEDDING_LENGTH = 1536
+EXPECTED_EMBEDDING_LENGTH = settings.OPENAI_DIMENSIONS
 BATCH_SIZE = 50  # Database write batch; API requests also enforce the token budget
 MAX_CONCURRENT_REQUESTS = 10  # Adjust this based on your rate limits and system capabilities
 
@@ -43,19 +70,24 @@ MAX_BATCH_INPUTS = 2048
 
 @retry(
     retry=retry_if_exception_type((APIConnectionError, APITimeoutError, InternalServerError, RateLimitError)),
-    wait=wait_random_exponential(min=1, max=20), stop=stop_after_attempt(6), reraise=True,
+    wait=wait_random_exponential(min=1, max=20),
+    stop=stop_after_attempt(settings.OPENAI_MAX_RETRIES + 1), reraise=True,
 )
 async def _request_embeddings(inputs, model):
-    return await openai.embeddings.create(input=inputs, model=model)
+    kwargs = {"input": inputs, "model": model}
+    if "3-" in model:
+        kwargs["dimensions"] = settings.OPENAI_DIMENSIONS
+    return await get_openai_client().embeddings.create(**kwargs)
 
 
-async def get_embedding(text: str, model="text-embedding-3-small") -> list[float]:
+async def get_embedding(text: str, model=None) -> list[float]:
     return (await get_embedding_batch([text], model=model))[0]
 
 
-async def get_embedding_batch(texts, model="text-embedding-3-small") -> list[list[float]]:
+async def get_embedding_batch(texts, model=None) -> list[list[float]]:
+    model = model or settings.OPENAI_EMBEDDING_MODEL
     # Token arrays avoid repeated tokenization and preserve exact truncation limits.
-    inputs = [(tokenizer.encode(text, disallowed_special=()) if isinstance(text, str) else text)[:MAX_TOKENS]
+    inputs = [(get_tokenizer().encode(text, disallowed_special=()) if isinstance(text, str) else text)[:MAX_TOKENS]
               for text in texts]
     if any(not tokens for tokens in inputs):
         raise ValueError("Embedding inputs must not be empty")
@@ -90,7 +122,7 @@ async def get_db_pool():
             user=settings.MYSQL_USER,
             password=settings.MYSQL_PASSWORD,
             db=settings.MYSQL_DATABASE,
-            autocommit=False,
+            autocommit=True,
             pool_recycle=3600,
             maxsize=20
         )
@@ -110,7 +142,7 @@ async def rebuild_database(pool):
     await process_posts(pool)
 
 def count_tokens(text):
-    return len(tokenizer.encode(text, disallowed_special=()))
+    return len(get_tokenizer().encode(text, disallowed_special=()))
 
 def validate_embedding(embedding):
     if embedding is None:
@@ -154,7 +186,7 @@ async def _process_batch(pool, batch, repair=False):
             if item['post_id'] in seen:
                 continue
             seen.add(item['post_id'])
-            tokens = tokenizer.encode(item['message'], disallowed_special=())
+            tokens = get_tokenizer().encode(item['message'], disallowed_special=())
             if not tokens:
                 logging.warning("Skipping empty message for post_id %s", item['post_id'])
                 continue
@@ -169,28 +201,40 @@ async def _process_batch(pool, batch, repair=False):
             if not valid:
                 raise ValueError(f"Invalid embedding response: {reason}")
         async with pool.acquire() as conn:
-            async with conn.cursor() as cursor:
-                for (item, _, is_truncated), embedding in zip(prepared, embeddings):
-                    vector_json = json.dumps(embedding, allow_nan=False)
-                    if repair:
-                        await cursor.execute('''
-                            UPDATE openai_embeddings
-                            SET embedding = VEC_FromText(%s), embedding_length = %s,
-                                is_truncated = %s, last_updated = NOW()
-                            WHERE post_id = %s AND section = 0
-                        ''', (vector_json, len(embedding), is_truncated, item['post_id']))
-                    else:
-                        await cursor.execute('''
-                            INSERT INTO openai_embeddings
-                            (post_id, embedding, embedding_length, is_truncated, section, last_updated)
-                            VALUES (%s, VEC_FromText(%s), %s, %s, %s, NOW())
-                            ON DUPLICATE KEY UPDATE
-                                embedding = VALUES(embedding),
-                                embedding_length = VALUES(embedding_length),
-                                is_truncated = VALUES(is_truncated),
-                                last_updated = NOW()
-                        ''', (item['post_id'], vector_json, len(embedding), is_truncated, 0))
-                await conn.commit()
+            # Reads use autocommit so pool release can reuse their connections;
+            # writes retain one atomic transaction for the complete batch.
+            try:
+                await conn.begin()
+                async with conn.cursor() as cursor:
+                    for (item, _, is_truncated), embedding in zip(prepared, embeddings):
+                        vector_json = json.dumps(embedding, allow_nan=False)
+                        if repair:
+                            await cursor.execute('''
+                                UPDATE openai_embeddings
+                                SET embedding = VEC_FromText(%s), embedding_length = %s,
+                                    is_truncated = %s, last_updated = NOW()
+                                WHERE post_id = %s AND section = 0
+                            ''', (vector_json, len(embedding), is_truncated, item['post_id']))
+                        else:
+                            await cursor.execute('''
+                                INSERT INTO openai_embeddings
+                                (post_id, embedding, embedding_length, is_truncated, section, last_updated)
+                                VALUES (%s, VEC_FromText(%s), %s, %s, %s, NOW())
+                                ON DUPLICATE KEY UPDATE
+                                    embedding = VALUES(embedding),
+                                    embedding_length = VALUES(embedding_length),
+                                    is_truncated = VALUES(is_truncated),
+                                    last_updated = NOW()
+                            ''', (item['post_id'], vector_json, len(embedding), is_truncated, 0))
+                    await conn.commit()
+            except BaseException:
+                try:
+                    # Includes cancellation: finish the transaction before the
+                    # lease is returned so the connection remains reusable.
+                    await conn.rollback()
+                except BaseException:
+                    conn.close()
+                raise
         logging.info("Processed %s%s posts", len(prepared), " repair" if repair else "")
         return len(prepared)
 
@@ -339,7 +383,10 @@ async def main(args):
     finally:
         logging.info("Closing database pool")
         pool.close()
-        await pool.wait_closed()
+        try:
+            await pool.wait_closed()
+        finally:
+            await close_openai_client()
         logging.info("Database pool closed")
 
 if __name__ == "__main__":

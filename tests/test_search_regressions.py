@@ -113,6 +113,23 @@ def test_invalid_hybrid_algorithm_fails_before_search(monkeypatch):
     elastic.assert_not_called()
 
 
+@pytest.mark.parametrize("limit", [0, -1, 1.5, True])
+def test_invalid_result_limits_fail_before_embedding_or_search(monkeypatch, limit):
+    embedding = AsyncMock(side_effect=AssertionError("invalid request generated embedding"))
+    vector = AsyncMock(side_effect=AssertionError("invalid request launched vector search"))
+    elastic = AsyncMock(side_effect=AssertionError("invalid request launched keyword search"))
+    monkeypatch.setattr(hybrid_search, "generate_embedding", embedding)
+    monkeypatch.setattr(hybrid_search, "search_faiss", vector)
+    monkeypatch.setattr(hybrid_search, "search_elasticsearch", elastic)
+    with pytest.raises(ValueError, match="max_results"):
+        asyncio.run(hybrid_search.perform_vector_search("query", max_results=limit))
+    with pytest.raises(ValueError, match="max_results"):
+        asyncio.run(hybrid_search.perform_hybrid_search("query", max_results=limit))
+    embedding.assert_not_called()
+    vector.assert_not_called()
+    elastic.assert_not_called()
+
+
 def test_invalid_request_algorithm_is_rejected_before_search(monkeypatch):
     search = AsyncMock(return_value=([], [], []))
     monkeypatch.setattr(api, "perform_hybrid_search", search)
@@ -121,6 +138,43 @@ def test_invalid_request_algorithm_is_rejected_before_search(monkeypatch):
     )
     assert response.status_code == 422
     search.assert_not_called()
+
+
+@pytest.mark.parametrize("path", ["/faiss/search/", "/faiss/elastic/", "/faiss/combined/"])
+@pytest.mark.parametrize("query", ["", " ", "\t\r\n", "\u2003\u00a0"])
+def test_blank_query_is_rejected_before_cache_or_backend_work(monkeypatch, path, query):
+    collaborators = []
+    for name in ("get_cached_search_results", "cache_search_results", "perform_vector_search",
+                 "search_elasticsearch", "perform_hybrid_search"):
+        collaborator = AsyncMock(side_effect=AssertionError("Blank query launched work"))
+        collaborators.append(collaborator)
+        monkeypatch.setattr(api, name, collaborator)
+    response = TestClient(api.create_app()).post(path, json={"query": query})
+    assert response.status_code == 422
+    for collaborator in collaborators:
+        collaborator.assert_not_called()
+
+
+def test_query_validation_preserves_nonblank_input():
+    assert api.QueryRequest(query="  Windows\t11  ").query == "  Windows\t11  "
+
+
+@pytest.mark.parametrize(("path", "search_name", "result", "payload"), [
+    ("/faiss/search/", "perform_vector_search", [], {"faiss_results": []}),
+    ("/faiss/elastic/", "search_elasticsearch", [], {"elasticsearch_results": []}),
+    ("/faiss/combined/", "perform_hybrid_search", ([], [], []), {"combined_results": [], "count": 0}),
+])
+def test_incomplete_cached_response_is_replaced_by_fresh_search(monkeypatch, path, search_name, result, payload):
+    monkeypatch.setattr(api, "get_cached_search_results", AsyncMock(return_value=payload))
+    search = AsyncMock(return_value=result)
+    write = AsyncMock()
+    monkeypatch.setattr(api, search_name, search)
+    monkeypatch.setattr(api, "cache_search_results", write)
+    response = TestClient(api.create_app()).post(path, json={"query": "query"})
+    assert response.status_code == 200
+    assert response.json()["cached"] is False
+    search.assert_awaited_once()
+    write.assert_awaited_once()
 
 
 def test_elasticsearch_outage_does_not_cache_an_empty_response(monkeypatch):

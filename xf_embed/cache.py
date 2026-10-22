@@ -3,6 +3,7 @@ from collections import OrderedDict
 import hashlib
 import json
 import logging
+import math
 import time
 from typing import Any, Dict, Optional
 
@@ -40,7 +41,7 @@ def _vector_cache_keys(query: str):
 def compute_search_cache_key(query: str, mode: str, max_results: int, algorithm: Optional[str] = None) -> str:
     # Include configuration that changes ranking and embedding spaces. Versioning
     # also prevents serving results produced before metadata/fusion fixes.
-    key = ["v2", query.strip().lower(), mode, max_results, algorithm or settings.HYBRID_ALGORITHM,
+    key = ["v3", query.strip().lower(), mode, max_results, algorithm or settings.HYBRID_ALGORITHM,
            settings.HYBRID_ALPHA, settings.RRF_K, settings.VECTOR_BACKEND,
            settings.FAISS_METRIC, settings.FAISS_INDEX_PATH, settings.ELASTICSEARCH_INDEX,
            settings.OPENAI_EMBEDDING_MODEL, settings.OPENAI_DIMENSIONS]
@@ -200,12 +201,77 @@ async def cache_query_vector(query: str, vector: np.ndarray, ttl: Optional[int] 
             logger.warning("Redis vector write failed: %s", exc)
 
 
+def _valid_search_results(data: Any) -> bool:
+    """Reject damaged cache records before promotion or permission lookups."""
+    if not isinstance(data, dict):
+        return False
+    fields = ("faiss_results", "combined_results", "vector_results", "elasticsearch_results")
+    primary = next((field for field in ("combined_results", "faiss_results", "elasticsearch_results")
+                    if field in data), None)
+    if "algorithm" in data and data["algorithm"] not in ("rrf", "weighted"):
+        return False
+    if "query" in data and not isinstance(data["query"], str):
+        return False
+    if "cached" in data and not isinstance(data["cached"], bool):
+        return False
+    if primary is not None and "count" not in data:
+        return False
+    if "count" in data and (type(data["count"]) is not int or data["count"] < 0):
+        return False
+
+    def finite_number(value):
+        try:
+            return type(value) in (int, float) and math.isfinite(value)
+        except OverflowError:
+            return False
+
+    if data.get("latency_ms") is not None and not finite_number(data["latency_ms"]):
+        return False
+    for field in fields:
+        if field not in data:
+            continue
+        items = data[field]
+        if items is None and field != primary:
+            continue
+        if not isinstance(items, list):
+            return False
+        for item in items:
+            if not isinstance(item, dict):
+                return False
+            identities = [item.get("post_id"), item.get("thread_id")]
+            if (not any(identities)
+                    or any(value is not None and (type(value) is not int or value <= 0)
+                           for value in identities)):
+                return False
+            if "type" in item and not isinstance(item["type"], str):
+                return False
+            if any(item.get(key) is not None and not isinstance(item[key], str)
+                   for key in ("thread_title", "message", "username")):
+                return False
+            if item.get("post_date") is not None and type(item["post_date"]) is not int:
+                return False
+            if "score" in item and not finite_number(item["score"]):
+                return False
+            if any(item.get(key) is not None and not finite_number(item[key])
+                   for key in ("rrf_score", "distance")):
+                return False
+            ranks = item.get("ranks")
+            if ranks is not None and (not isinstance(ranks, dict)
+                                      or any(not isinstance(key, str) or type(value) is not int
+                                             for key, value in ranks.items())):
+                return False
+    return primary is None or data["count"] == len(data[primary])
+
+
 async def get_cached_search_results(cache_key: str) -> Optional[Dict[str, Any]]:
     if not settings.CACHE_ENABLED:
         return None
     mem_key = f"res:{cache_key}"
     entry = _memory_get(mem_key)
     if entry is not None:
+        if not _valid_search_results(entry["data"]):
+            _local_memory_cache.pop(mem_key, None)
+            return None
         return await _validate_search_results(entry["data"])
     client = await get_redis_client()
     if client is not None:
@@ -222,7 +288,7 @@ async def get_cached_search_results(cache_key: str) -> Optional[Dict[str, Any]]:
                 except (ValueError, UnicodeError, TypeError):
                     # A damaged entry is a miss, not a connection outage.
                     return None
-                if isinstance(data, dict):
+                if _valid_search_results(data):
                     _memory_put(mem_key, {"data": data}, ttl)
                     # Keep database failures outside Redis error handling.
                     redis_data = data
@@ -239,7 +305,7 @@ async def get_cached_search_results(cache_key: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def _validate_search_results(data: Dict[str, Any]) -> Dict[str, Any]:
+async def _validate_search_results(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Recheck current guest visibility/state on every cache hit in one batch.
 
     Post deletion/moderation and permission changes do not necessarily change
@@ -284,12 +350,16 @@ async def _validate_search_results(data: Dict[str, Any]) -> Dict[str, Any]:
     primary = next((field for field in ("combined_results", "faiss_results", "elasticsearch_results")
                     if field in validated), None)
     if primary is not None:
+        if len(validated[primary]) != len(data[primary]):
+            # Re-run retrieval to replace deleted/private candidates with the
+            # next eligible hits rather than cache a shortened result page.
+            return None
         validated["count"] = len(validated[primary])
     return validated
 
 
 async def cache_search_results(cache_key: str, data: Dict[str, Any], ttl: Optional[int] = None) -> None:
-    if not settings.CACHE_ENABLED:
+    if not settings.CACHE_ENABLED or not _valid_search_results(data):
         return
     target_ttl = settings.SEARCH_RESULT_CACHE_TTL if ttl is None else ttl
     if target_ttl <= 0:

@@ -3,6 +3,7 @@ import asyncio
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from openai import AsyncOpenAI as SDKAsyncOpenAI
@@ -25,7 +26,7 @@ def generator(request, monkeypatch):
     import openai
     import tiktoken
     import xf_embed.config
-    client = SimpleNamespace(embeddings=SimpleNamespace(create=None))
+    client = SimpleNamespace(embeddings=SimpleNamespace(create=None), close=AsyncMock())
     monkeypatch.setattr(openai, 'AsyncOpenAI', lambda **kwargs: setattr(client, 'init_kwargs', kwargs) or client)
     tokenizer = Tokenizer()
     monkeypatch.setattr(tiktoken, 'encoding_for_model', lambda _: tokenizer)
@@ -44,7 +45,8 @@ def test_batch_respects_aggregate_and_per_input_limits(generator):
     module, client, tokenizer = generator
     requests = []
 
-    async def create(*, input, model):
+    async def create(*, input, model, dimensions):
+        assert dimensions == module.EXPECTED_EMBEDDING_LENGTH
         lengths = [len(value) for value in input]
         assert max(lengths) <= module.MAX_TOKENS
         assert sum(lengths) <= 300_000
@@ -86,6 +88,7 @@ class Pool:
         self.queries = []
         self.commits = 0
         self.closed = False
+        self.begins = 0
 
     def acquire(self):
         return self
@@ -110,6 +113,9 @@ class Pool:
 
     async def commit(self):
         self.commits += 1
+
+    async def begin(self):
+        self.begins += 1
 
     def close(self):
         self.closed = True
@@ -155,7 +161,7 @@ def test_batch_skips_empty_text_preserves_truncation_and_tokenizes_once(generato
     module, client, tokenizer = generator
     requests = []
 
-    async def create(*, input, model):
+    async def create(*, input, model, dimensions):
         requests.append(input)
         return SimpleNamespace(data=[SimpleNamespace(index=i, embedding=[1.0] * 1536)
                                      for i in range(len(input))])
@@ -173,6 +179,7 @@ def test_batch_skips_empty_text_preserves_truncation_and_tokenizes_once(generato
     query, params = pool.queries[0]
     assert params[2 if repair else 3] is True
     assert pool.commits == 1
+    assert pool.begins == 1
 
 
 def test_malformed_response_does_not_retry_or_write(generator):
@@ -288,6 +295,7 @@ def test_retry_policy_has_one_layer_at_the_http_transport(generator, monkeypatch
         http_client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
         # Reuse actual module-constructor options so enabling SDK retry layers
         # regresses transport counts, rather than merely a source assertion.
+        module.get_openai_client()
         sdk = SDKAsyncOpenAI(**client.init_kwargs, http_client=http_client)
         monkeypatch.setattr(module, 'openai', sdk)
         monkeypatch.setattr(module._request_embeddings.retry, 'stop', stop_after_attempt(2))
@@ -300,3 +308,246 @@ def test_retry_policy_has_one_layer_at_the_http_transport(generator, monkeypatch
 
     asyncio.run(scenario())
     assert len(calls) == expected_attempts
+
+
+def test_configured_model_and_dimensions_reach_api_and_database(generator, monkeypatch):
+    module, client, _ = generator
+    monkeypatch.setattr(module.settings, 'OPENAI_EMBEDDING_MODEL', 'text-embedding-3-large')
+    monkeypatch.setattr(module.settings, 'OPENAI_DIMENSIONS', 3072)
+    entity = module.entity
+    spec = importlib.util.spec_from_file_location(f'configured_generator_{entity}', module.__file__)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.entity = entity
+    assert module.EXPECTED_EMBEDDING_LENGTH == 3072
+    requests = []
+
+    async def create(**kwargs):
+        requests.append(kwargs)
+        return SimpleNamespace(data=[SimpleNamespace(index=0, embedding=[1.0] * 3072)])
+
+    client.embeddings.create = create
+    field = 'message' if module.entity == 'post' else 'title'
+    pool = Pool()
+    asyncio.run(module.process_batch_with_semaphore(pool, [{f'{module.entity}_id': 1, field: 'text'}]))
+    assert requests == [{'input': [[ord(char) for char in 'text']],
+                         'model': 'text-embedding-3-large', 'dimensions': 3072}]
+    assert pool.queries[0][1][2] == 3072
+    assert client.init_kwargs['timeout'] == module.settings.OPENAI_REQUEST_TIMEOUT
+    assert client.init_kwargs['max_retries'] == 0
+
+
+def test_check_needs_no_api_key_or_tokenizer(generator, monkeypatch):
+    module, client, tokenizer = generator
+    monkeypatch.setattr(module.settings, 'OPENAI_API_KEY', '')
+    pool = Pool(rows=[(0,)])
+
+    async def get_pool():
+        return pool
+
+    async def fetch_rows(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(module, 'get_db_pool', get_pool)
+    monkeypatch.setattr(module, '_fetch_embedding_rows', fetch_rows)
+    args = SimpleNamespace(check=True, repair=False, rebuild=False, post=None, thread=None)
+    asyncio.run(module.main(args))
+    assert module.openai is None
+    assert not hasattr(client, 'init_kwargs')
+    assert tokenizer.calls == 0
+    assert pool.closed
+
+
+def test_help_needs_no_api_key_or_tokenizer(generator, monkeypatch, capsys):
+    import runpy
+    import sys
+    import openai
+    import tiktoken
+    module, _, _ = generator
+    monkeypatch.setattr(module.settings, 'OPENAI_API_KEY', '')
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError('Help must not initialize embedding resources')
+
+    monkeypatch.setattr(openai, 'AsyncOpenAI', unexpected)
+    monkeypatch.setattr(tiktoken, 'encoding_for_model', unexpected)
+    monkeypatch.setattr(sys, 'argv', [module.__file__, '--help'])
+    with pytest.raises(SystemExit) as exc:
+        runpy.run_path(module.__file__, run_name='__main__')
+    assert exc.value.code == 0
+    assert '--check' in capsys.readouterr().out
+
+
+def test_main_closes_lazy_api_client(generator, monkeypatch):
+    module, client, _ = generator
+    pool = Pool()
+
+    async def get_pool():
+        return pool
+
+    async def process(pool):
+        module.get_openai_client()
+        raise RuntimeError('offline generation failure')
+
+    monkeypatch.setattr(module, 'get_db_pool', get_pool)
+    monkeypatch.setattr(module, f'process_{module.entity}s', process)
+    args = SimpleNamespace(check=False, repair=False, rebuild=False, post=None, thread=None)
+    with pytest.raises(RuntimeError, match='offline generation failure'):
+        asyncio.run(module.main(args))
+    assert pool.closed
+    client.close.assert_awaited_once_with()
+    assert module.openai is None
+
+
+@pytest.fixture
+def maintenance_connections(monkeypatch):
+    """Use the actual asyncmy pool with an offline transaction-aware connection."""
+    import asyncmy.pool
+    from asyncmy.connection import Connection
+    connections = []
+
+    class MaintenanceConnection(Connection):
+        def __init__(self, **kwargs):
+            self.autocommit_enabled = kwargs['autocommit']
+            self.server_status = 0
+            self.was_closed = False
+            self.commits = 0
+            self.rollbacks = 0
+            self.write_attempts = 0
+            self.staged = []
+            self.durable = []
+            self.failure_kind = None
+
+        @property
+        def connected(self):
+            return not self.was_closed
+
+        @property
+        def _stream_broken(self):
+            return self.was_closed
+
+        @property
+        def last_usage(self):
+            return asyncio.get_running_loop().time()
+
+        def cursor(self):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def execute(self, query, params=None):
+            if query.lstrip().startswith(('INSERT', 'UPDATE')):
+                self.write_attempts += 1
+                if self.write_attempts == 2 and self.failure_kind:
+                    if self.failure_kind == 'cancelled':
+                        asyncio.current_task().cancel()
+                        await asyncio.sleep(0)
+                    raise RuntimeError('offline write failure')
+                if self.server_status & 1:
+                    self.staged.append(params)
+                else:
+                    self.durable.append(params)
+            elif not self.autocommit_enabled:
+                # InnoDB reads open a transaction without autocommit.
+                self.server_status |= 1
+
+        async def fetchall(self):
+            return []
+
+        async def fetchone(self):
+            return (0,)
+
+        async def begin(self):
+            self.server_status |= 1
+
+        async def commit(self):
+            self.commits += 1
+            self.durable.extend(self.staged)
+            self.staged.clear()
+            self.server_status = 0
+
+        async def rollback(self):
+            self.rollbacks += 1
+            await asyncio.sleep(0)
+            if self.failure_kind == 'rollback_failure':
+                raise RuntimeError('offline rollback failure')
+            self.staged.clear()
+            self.server_status = 0
+
+        def close(self):
+            self.was_closed = True
+            self.staged.clear()
+
+        async def ensure_closed(self):
+            self.close()
+
+    async def connect(**kwargs):
+        conn = MaintenanceConnection(**kwargs)
+        connections.append(conn)
+        return conn
+
+    monkeypatch.setattr(asyncmy.pool, 'connect', connect)
+    return connections
+
+
+def test_read_pages_reuse_real_driver_pool_connections(generator, maintenance_connections):
+    module, _, _ = generator
+
+    async def scenario():
+        pool = await module.get_db_pool()
+        try:
+            for _ in range(3):
+                await getattr(module, f'fetch_{module.entity}s')(pool, 0, 10)
+                await module._fetch_embedding_rows(pool, 0, 10)
+                await module._embedding_count(pool)
+            assert len(maintenance_connections) == 1
+            assert not maintenance_connections[0].was_closed
+        finally:
+            pool.close()
+            await pool.wait_closed()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('repair', [False, True])
+@pytest.mark.parametrize('failure_kind', ['failure', 'cancelled', 'rollback_failure'])
+def test_failed_write_rolls_back_before_pool_release(generator, maintenance_connections, repair, failure_kind):
+    module, client, _ = generator
+
+    async def create(**kwargs):
+        return SimpleNamespace(data=[SimpleNamespace(index=i, embedding=[1.0] * 1536) for i in range(2)])
+
+    client.embeddings.create = create
+    field = 'message' if module.entity == 'post' else 'title'
+    batch = [{f'{module.entity}_id': i, field: 'text'} for i in (1, 2)]
+
+    async def scenario():
+        pool = await module.get_db_pool()
+        conn = maintenance_connections[0]
+        conn.failure_kind = failure_kind
+        try:
+            error = asyncio.CancelledError if failure_kind == 'cancelled' else RuntimeError
+            match = None if failure_kind == 'cancelled' else 'offline write failure'
+            with pytest.raises(error, match=match):
+                await module._process_batch(pool, batch, repair=repair)
+            assert conn.write_attempts == 2
+            assert conn.commits == 0
+            assert conn.rollbacks == 1
+            assert conn.staged == []
+            assert conn.durable == []
+            if failure_kind == 'rollback_failure':
+                assert conn.was_closed
+            else:
+                assert not conn.was_closed
+                assert pool.freesize == 1
+                await module._embedding_count(pool)
+                assert len(maintenance_connections) == 1
+        finally:
+            pool.close()
+            await pool.wait_closed()
+
+    asyncio.run(scenario())

@@ -98,6 +98,110 @@ def test_search_with_no_public_nodes_skips_elasticsearch(monkeypatch):
     search.assert_not_called()
 
 
+def test_search_replenishes_rejected_pages_without_rehydrating_candidates(monkeypatch):
+    import copy
+
+    calls = []
+    hydrations = []
+
+    def hit(identifier):
+        return {"_id": f"post-{identifier}", "_score": 100 - identifier,
+                "_source": {"type": "post", "discussion_id": 42},
+                "sort": [100 - identifier, 1700000000, identifier]}
+
+    async def search(**kwargs):
+        calls.append(copy.deepcopy(kwargs))
+        body = kwargs["body"]
+        if "pit" not in body:
+            return {"hits": {"hits": [hit(1), hit(2)]}}
+        start = body.get("search_after", [0, 0, 0])[-1]
+        rows = [hit(i) for i in range(start + 1, min(start + body["size"], 24) + 1)]
+        return {"pit_id": f"snapshot-{start}", "hits": {"hits": rows}}
+
+    async def hydrate(pool, items, visible_node_ids):
+        hydrations.append([item["post_id"] for item in items])
+        return [{**item, "thread_title": "current"} for item in items if item["post_id"] > 20]
+
+    client = type("FakeES", (), {})()
+    client.search = search
+    client.open_point_in_time = AsyncMock(return_value={"id": "snapshot"})
+    client.close_point_in_time = AsyncMock()
+    monkeypatch.setattr(elastic_engine, "get_es_client", lambda: client)
+    monkeypatch.setattr(elastic_engine, "fetch_details_for_posts_and_threads", hydrate)
+    results = asyncio.run(elastic_engine.search_elasticsearch("query", max_results=2))
+    assert [item["post_id"] for item in results] == [21, 22]
+    assert [item["es_score"] for item in results] == [79, 78]
+    assert hydrations == [[1, 2], list(range(3, 21)), [21, 22, 23, 24]]
+    assert len(calls) == 3
+    assert "index" not in calls[1] and "index" not in calls[2]
+    assert calls[2]["body"]["search_after"] == [80, 1700000000, 20]
+    assert calls[2]["body"]["pit"]["id"] == "snapshot-0"
+    assert all(call["body"]["track_total_hits"] is False for call in calls)
+    client.close_point_in_time.assert_awaited_once_with(id="snapshot-20")
+
+
+def test_full_valid_first_page_does_not_open_a_snapshot(monkeypatch):
+    client = type("FakeES", (), {})()
+    client.search = AsyncMock(return_value={"hits": {"hits": [
+        {"_id": "post-1", "_score": 5, "_source": {"type": "post"}},
+    ]}})
+    client.open_point_in_time = AsyncMock(side_effect=AssertionError("unnecessary snapshot"))
+    monkeypatch.setattr(elastic_engine, "get_es_client", lambda: client)
+    async def hydrate(pool, items, visible_node_ids):
+        return items
+    monkeypatch.setattr(elastic_engine, "fetch_details_for_posts_and_threads", hydrate)
+    assert len(asyncio.run(elastic_engine.search_elasticsearch("query", max_results=1))) == 1
+    client.search.assert_awaited_once()
+    client.open_point_in_time.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("hydration failed"), asyncio.CancelledError()])
+def test_search_snapshot_closes_after_failure_or_cancellation(monkeypatch, failure):
+    hit = {"_id": "post-1", "_score": 5, "_source": {"type": "post"}}
+    client = type("FakeES", (), {})()
+    client.search = AsyncMock(side_effect=[
+        {"hits": {"hits": [hit]}},
+        {"pit_id": "latest", "hits": {"hits": [{**hit, "_id": "post-2"}]}},
+    ])
+    client.open_point_in_time = AsyncMock(return_value={"id": "snapshot"})
+    client.close_point_in_time = AsyncMock()
+    monkeypatch.setattr(elastic_engine, "get_es_client", lambda: client)
+    monkeypatch.setattr(elastic_engine, "fetch_details_for_posts_and_threads",
+                        AsyncMock(side_effect=[[], failure]))
+    with pytest.raises(type(failure)):
+        asyncio.run(elastic_engine.search_elasticsearch("query", max_results=1))
+    client.close_point_in_time.assert_awaited_once_with(id="latest")
+
+
+def test_repeated_search_after_cursor_fails_without_looping(monkeypatch):
+    hit = {"_id": "post-1", "_score": 5, "_source": {"type": "post"}, "sort": [5, 1, 1]}
+    client = type("FakeES", (), {})()
+    client.search = AsyncMock(side_effect=[
+        {"hits": {"hits": [hit]}},
+        {"hits": {"hits": [hit] * 20}},
+        {"hits": {"hits": [hit] * 20}},
+    ])
+    client.open_point_in_time = AsyncMock(return_value={"id": "snapshot"})
+    client.close_point_in_time = AsyncMock()
+    hydrate = AsyncMock(return_value=[])
+    monkeypatch.setattr(elastic_engine, "get_es_client", lambda: client)
+    monkeypatch.setattr(elastic_engine, "fetch_details_for_posts_and_threads", hydrate)
+    with pytest.raises(RuntimeError, match="pagination did not advance"):
+        asyncio.run(elastic_engine.search_elasticsearch("query", max_results=1))
+    assert client.search.await_count == 3
+    hydrate.assert_awaited_once()
+    client.close_point_in_time.assert_awaited_once_with(id="snapshot")
+
+
+@pytest.mark.parametrize("limit", [0, -1, 1.5, True])
+def test_search_rejects_nonpositive_limits_before_backend_work(monkeypatch, limit):
+    pool = AsyncMock(side_effect=AssertionError("invalid request launched work"))
+    monkeypatch.setattr(elastic_engine, "get_db_pool", pool)
+    with pytest.raises(ValueError, match="max_results"):
+        asyncio.run(elastic_engine.search_elasticsearch("query", max_results=limit))
+    pool.assert_not_called()
+
+
 def test_bulk_derives_typed_identity_from_thread_and_nested_source_documents(monkeypatch):
     monkeypatch.setattr(elastic_engine, "get_es_client", lambda: object())
 

@@ -14,6 +14,30 @@ def test_literal_special_tokens_are_ordinary_user_text():
     assert embeddings.count_tokens(text) > 0
 
 
+@pytest.mark.parametrize('text', ['', ' \t\n', '\u2003'])
+def test_blank_single_embedding_skips_cache_and_transports(text, monkeypatch):
+    cached = AsyncMock()
+    local = AsyncMock()
+    direct = AsyncMock()
+    monkeypatch.setattr(embeddings, 'get_cached_query_vector', cached)
+    monkeypatch.setattr(embeddings, '_generate_via_local_service', local)
+    monkeypatch.setattr(embeddings, '_generate_via_openai_api', direct)
+    with pytest.raises(ValueError, match='non-whitespace'):
+        asyncio.run(embeddings.generate_embedding(text))
+    cached.assert_not_awaited()
+    local.assert_not_awaited()
+    direct.assert_not_awaited()
+
+
+@pytest.mark.parametrize('text', ['', ' \t\n', '\u2003'])
+def test_blank_batch_is_rejected_before_any_paid_work(text, monkeypatch):
+    request = AsyncMock()
+    monkeypatch.setattr(embeddings, '_request_batch', request)
+    with pytest.raises(ValueError, match='non-whitespace'):
+        asyncio.run(embeddings.generate_embeddings_batch(['valid post', text]))
+    request.assert_not_awaited()
+
+
 @pytest.mark.parametrize('vector', [[float('nan')] * 1536, [[1]] * 1536, [0] * 1536])
 def test_malformed_local_vector_falls_back(vector, monkeypatch):
     response = SimpleNamespace(status_code=200, json=lambda: {'embedding': vector})
@@ -58,6 +82,45 @@ def test_identical_embedding_misses_share_work_and_cancellation(monkeypatch):
         assert all(np.array_equal(vector, np.ones(1536)) for vector in results)
         embeddings.cache_query_vector.assert_awaited_once()
         assert not embeddings._inflight
+    asyncio.run(run())
+
+
+def test_shutdown_cancels_shielded_embedding_before_closing_cache(monkeypatch):
+    from xf_embed import api, cache
+    async def run():
+        started, release = asyncio.Event(), asyncio.Event()
+        async def generate(text):
+            started.set()
+            await release.wait()
+            return np.ones(1536, dtype=np.float32)
+        class Redis:
+            async def aclose(self):
+                # Closing the pool yields while a pending generation finishes.
+                release.set()
+                await asyncio.sleep(0)
+        monkeypatch.setattr(cache, '_redis_client', Redis())
+        monkeypatch.setattr(embeddings, '_inflight', {})
+        monkeypatch.setattr(embeddings, '_httpx_client', None)
+        monkeypatch.setattr(embeddings, '_openai_client', None)
+        monkeypatch.setattr(embeddings, 'get_cached_query_vector', AsyncMock(return_value=None))
+        monkeypatch.setattr(embeddings, '_generate_via_local_service', generate)
+        monkeypatch.setattr(embeddings.settings, 'USE_LOCAL_EMBEDDING_SERVICE', True)
+        monkeypatch.setattr(embeddings.settings, 'LOCAL_EMBEDDING_MODEL', embeddings.settings.OPENAI_EMBEDDING_MODEL)
+        monkeypatch.setattr(api, 'get_db_pool', AsyncMock(return_value=object()))
+        monkeypatch.setattr(api, 'close_db_pool', AsyncMock())
+        monkeypatch.setattr(api, 'close_es_client', AsyncMock())
+        async with api.lifespan(api.create_app()):
+            caller = asyncio.create_task(embeddings.generate_embedding('shutdown race', normalize=False))
+            await started.wait()
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+            pending = list(embeddings._inflight.values())
+            assert len(pending) == 1 and not pending[0].done()
+        await asyncio.sleep(0)
+        assert not cache._local_memory_cache
+        assert not embeddings._inflight
+        assert pending[0].cancelled()
     asyncio.run(run())
 
 

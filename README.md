@@ -17,6 +17,7 @@ Modern, high-performance semantic and hybrid search solution for XenForo forums.
 - **Interactive CLI (`xf-search`)**: Built with Typer and Rich for easy server management, index generation, terminal search queries, and latency benchmarking.
 - **Guest Visibility**: Searches restrict results to visible posts/threads in forums readable by XenForo's guest permission combination. Missing permission authority fails closed. Cached hits recheck current permissions and content state.
 - **Bounded Caching**: Memory LRU and Redis TTL-aware promotion, model-specific vector keys, and shared in-flight embedding generation for identical requests.
+- **Complete Result Selection**: Replace stale or hidden candidates, count unique posts/threads across vector sections, and refresh cached searches when an item becomes unavailable. Keyword pagination uses a short-lived Elasticsearch point in time only when the first page needs replacements.
 - **Automated Test Suite**: Offline regression tests cover search, caches, SQL hydration, maintenance scripts, CLI lifecycle, and PHP input handling.
 
 ---
@@ -229,6 +230,18 @@ whose `post_id` is NULL. Rebuilds preserve the other entity's vectors and post
 sections. `create_tables.py` creates the appropriate compound/conditional unique
 keys for new tables; it does not migrate existing tables. Existing schemas need
 equivalent keys for safe upserts.
+
+Both generators honor `OPENAI_EMBEDDING_MODEL` and `OPENAI_DIMENSIONS`; changing
+the embedding space requires regenerating existing vectors and rebuilding the
+search index. Database-only `--check` and `--help` do not require an API key.
+Generator reads reuse autocommit connections, while each write batch remains
+an explicit transaction.
+
+The Elasticsearch embedding exporter retains `post-N` for section 0 and
+`thread-N` for thread titles, using `post-N-section-K` for other post sections.
+It includes `record_id` and `section` metadata. Re-exporting restores sections
+that an older exporter overwrote; use `--overwrite` when also removing obsolete
+documents or changing vector dimensions (this recreates the target index).
 
 ---
 

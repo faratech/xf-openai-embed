@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from numbers import Integral
 from typing import Any, Dict, List, Optional, Tuple
 import asyncmy.cursors
 import numpy as np
@@ -278,6 +279,9 @@ async def search_mariadb_native_vector(
     Performs cosine similarity search directly inside MariaDB 12 using VEC_DISTANCE_COSINE.
     Distance = 1 - cosine_similarity. Similarity = 1 - distance.
     """
+    if isinstance(top_k, bool) or not isinstance(top_k, Integral) or top_k <= 0:
+        raise ValueError("top_k must be a positive integer")
+    top_k = int(top_k)
     visible_nodes = sorted(await guest_visible_node_ids(pool))
     if not visible_nodes:
         return []
@@ -286,35 +290,42 @@ async def search_mariadb_native_vector(
     zero_vector = np.zeros(settings.OPENAI_DIMENSIONS, dtype=np.float32).tobytes()
 
     query = f"""
-        SELECT * FROM (
         SELECT
-            e.id,
-            e.post_id,
-            COALESCE(p.thread_id, e.thread_id) AS thread_id,
+            candidates.post_id,
+            candidates.thread_id,
             COALESCE(p.message, '') AS message,
-            COALESCE(t.title, xt.title, '') AS thread_title,
-            COALESCE(p.post_date, xt.last_post_date, 0) AS post_date,
-            COALESCE(p.username, xt.username, '') AS username,
-            COALESCE(p.user_id, xt.user_id, 0) AS user_id,
-            COALESCE(t.node_id, xt.node_id) AS node_id,
-            VEC_DISTANCE_COSINE(e.embedding, VEC_FromText(%s)) AS distance
-        FROM openai_embeddings e
-        LEFT JOIN xf_post p ON e.post_id = p.post_id
-        LEFT JOIN xf_thread t ON p.thread_id = t.thread_id
-        LEFT JOIN xf_thread xt ON e.thread_id = xt.thread_id
-        WHERE e.embedding IS NOT NULL
-            AND OCTET_LENGTH(e.embedding) = %s
-            AND VEC_DISTANCE_EUCLIDEAN(e.embedding, %s) > 0
-            AND (
-                (e.post_id IS NOT NULL AND p.message_state = 'visible'
-                    AND t.discussion_state = 'visible' AND t.node_id IN ({node_placeholders}))
-                OR (e.post_id IS NULL AND xt.discussion_state = 'visible'
-                    AND xt.node_id IN ({node_placeholders}))
-            )
+            COALESCE(t.title, '') AS thread_title,
+            COALESCE(p.post_date, t.last_post_date, 0) AS post_date,
+            COALESCE(p.username, t.username, '') AS username,
+            COALESCE(p.user_id, t.user_id, 0) AS user_id,
+            t.node_id,
+            candidates.distance
+        FROM (
+            SELECT
+                e.post_id,
+                COALESCE(p.thread_id, e.thread_id) AS thread_id,
+                MIN(VEC_DISTANCE_COSINE(e.embedding, VEC_FromText(%s))) AS distance
+            FROM openai_embeddings e
+            LEFT JOIN xf_post p ON e.post_id = p.post_id
+            LEFT JOIN xf_thread t ON p.thread_id = t.thread_id
+            LEFT JOIN xf_thread xt ON e.post_id IS NULL AND e.thread_id = xt.thread_id
+            WHERE e.embedding IS NOT NULL
+                AND OCTET_LENGTH(e.embedding) = %s
+                AND VEC_DISTANCE_EUCLIDEAN(e.embedding, %s) > 0
+                AND (
+                    (e.post_id IS NOT NULL AND p.message_state = 'visible'
+                        AND t.discussion_state = 'visible' AND t.node_id IN ({node_placeholders}))
+                    OR (e.post_id IS NULL AND xt.discussion_state = 'visible'
+                        AND xt.node_id IN ({node_placeholders}))
+                )
+            GROUP BY e.post_id, COALESCE(p.thread_id, e.thread_id)
+            HAVING distance IS NOT NULL
+            ORDER BY distance ASC, e.post_id ASC, COALESCE(p.thread_id, e.thread_id) ASC
+            LIMIT %s
         ) candidates
-        WHERE distance IS NOT NULL
-        ORDER BY distance ASC
-        LIMIT %s
+        LEFT JOIN xf_post p ON candidates.post_id = p.post_id
+        LEFT JOIN xf_thread t ON candidates.thread_id = t.thread_id
+        ORDER BY candidates.distance ASC, candidates.post_id ASC, candidates.thread_id ASC
     """
 
     async with pool.acquire() as conn:

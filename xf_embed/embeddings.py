@@ -183,6 +183,8 @@ async def generate_embedding(
     Generates embedding for a single text with multi-tier caching (Redis/memory)
     and local daemon fallback.
     """
+    if not text.strip():
+        raise ValueError("Embedding input must contain non-whitespace text")
     safe_text = truncate_text(text)
 
     # 1. Tier 1: Check Cache (0.1ms)
@@ -239,6 +241,8 @@ async def generate_embeddings_batch(
     """Generates embeddings for a batch of texts."""
     if not texts:
         return np.empty((0, settings.OPENAI_DIMENSIONS), dtype=np.float32)
+    if any(not text.strip() for text in texts):
+        raise ValueError("Embedding input must contain non-whitespace text")
 
     target_model = model or settings.OPENAI_EMBEDDING_MODEL
     tokenizer = get_tokenizer()

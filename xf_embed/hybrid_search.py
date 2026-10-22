@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from numbers import Integral
 from typing import Any, Dict, List, Optional, Tuple
 
 from xf_embed.config import settings
@@ -130,6 +131,7 @@ def weighted_score_fusion(
 
 async def perform_vector_search(query: str, max_results: int = 10) -> List[Dict[str, Any]]:
     """Generates query embedding and queries vector backend (FAISS or MariaDB native)."""
+    _validate_result_limit(max_results)
     query_vector = await generate_embedding(query)
 
     if settings.VECTOR_BACKEND == "mariadb":
@@ -137,6 +139,11 @@ async def perform_vector_search(query: str, max_results: int = 10) -> List[Dict[
         return await search_mariadb_native_vector(pool, query_vector, top_k=max_results)
     else:
         return await search_faiss(query_vector, top_k=max_results)
+
+
+def _validate_result_limit(max_results: int) -> None:
+    if isinstance(max_results, bool) or not isinstance(max_results, Integral) or max_results <= 0:
+        raise ValueError("max_results must be a positive integer")
 
 
 async def perform_hybrid_search(
@@ -149,6 +156,7 @@ async def perform_hybrid_search(
     then combines them using RRF or weighted score fusion.
     Returns (fused_results, vector_results, elastic_results).
     """
+    _validate_result_limit(max_results)
     chosen_algo = settings.HYBRID_ALGORITHM if algorithm is None else algorithm
     if chosen_algo not in ("rrf", "weighted"):
         raise ValueError(f"Unsupported hybrid algorithm: {chosen_algo!r}")

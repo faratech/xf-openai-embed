@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import tempfile
+from numbers import Integral
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import faiss
@@ -142,6 +143,9 @@ async def search_faiss(
     Searches the FAISS index with query vector, resolves the record IDs to forum
     posts/threads, and returns enriched result objects.
     """
+    if isinstance(top_k, bool) or not isinstance(top_k, Integral) or top_k <= 0:
+        raise ValueError("top_k must be a positive integer")
+    top_k = int(top_k)
     index = await get_faiss_index()
     if index is None or index.ntotal == 0:
         logger.warning("FAISS index is not initialized or empty.")
@@ -153,35 +157,58 @@ async def search_faiss(
 
     query_mat = np.ascontiguousarray(query_vector.reshape(1, -1), dtype=np.float32)
 
-    # Perform FAISS search (C++ thread-safe execution)
-    distances, indices = await asyncio.to_thread(index.search, query_mat, top_k)
-
-    scores = distances[0]
-    record_ids = indices[0]
-
-    # Filter out invalid indices (-1 in FAISS denotes empty results)
-    valid_results = [(int(rec_id), float(score)) for rec_id, score in zip(record_ids, scores) if rec_id != -1]
-    if not valid_results:
-        return []
-
-    # Map record_ids back to post_id/thread_id from DB in a single unified query
-    valid_ids = [r[0] for r in valid_results]
-    id_to_score = {r[0]: r[1] for r in valid_results}
-
-    pool = await get_db_pool()
     from xf_embed.db import fetch_details_by_record_ids
-    details_map = await fetch_details_by_record_ids(pool, valid_ids)
+    total_vectors = int(index.ntotal)
+    candidate_count = min(top_k, total_vectors)
+    pool = None
+    hydrated_ids = set()
+    details_map = {}
 
-    enriched = []
-    for rec_id in valid_ids:
-        if rec_id in details_map:
-            item = dict(details_map[rec_id])
-            score = id_to_score.get(rec_id, 0.0)
-            similarity = float(score) if settings.FAISS_METRIC == "cosine" else max(0.0, 1.0 / (1.0 + float(score)))
-            item["score"] = similarity
-            item["distance"] = float(score)
-            enriched.append(item)
+    while True:
+        # Authorization and section deduplication can remove the nearest rows.
+        # Expand until enough forum items remain or every vector was considered.
+        distances, indices = await asyncio.to_thread(index.search, query_mat, candidate_count)
+        enriched = {}
+        for offset in range(0, len(indices[0]), 1000):
+            batch = [
+                (int(rec_id), float(score)) for rec_id, score in zip(
+                    indices[0][offset:offset + 1000], distances[0][offset:offset + 1000],
+                ) if rec_id != -1
+            ]
+            new_ids = list(dict.fromkeys(rec_id for rec_id, _ in batch if rec_id not in hydrated_ids))
+            if new_ids:
+                if pool is None:
+                    pool = await get_db_pool()
+                details_map.update(await fetch_details_by_record_ids(pool, new_ids))
+                hydrated_ids.update(new_ids)
+            else:
+                # Large previously checked prefixes should not monopolize the
+                # event loop while the candidate window expands.
+                await asyncio.sleep(0)
 
-    # Sort enriched items according to score descending
-    enriched.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-    return enriched
+            for rec_id, score in batch:
+                if rec_id not in details_map:
+                    continue
+                item = dict(details_map[rec_id])
+                if item.get("post_id"):
+                    key = ("post", item["post_id"])
+                elif item.get("thread_id"):
+                    key = ("thread", item["thread_id"])
+                else:
+                    key = ("record", rec_id)
+                similarity = score if settings.FAISS_METRIC == "cosine" else max(0.0, 1.0 / (1.0 + score))
+                if key in enriched and enriched[key]["score"] >= similarity:
+                    continue
+                item["score"] = similarity
+                item["distance"] = score
+                enriched[key] = item
+
+            # FAISS returns candidates in metric order. Later batches cannot
+            # improve these best unique hits, so avoid hydrating the whole window.
+            if len(enriched) >= top_k:
+                break
+
+        ranked = sorted(enriched.values(), key=lambda item: item["score"], reverse=True)
+        if len(ranked) >= top_k or candidate_count >= total_vectors:
+            return ranked[:top_k]
+        candidate_count = min(candidate_count * 2, total_vectors)

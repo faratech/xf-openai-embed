@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from xf_embed.cache import (
     cache_search_results,
@@ -32,6 +32,13 @@ class QueryRequest(BaseModel):
     query: str = Field(..., min_length=1, description="Search query string")
     max_results: int = Field(10, ge=1, le=100, description="Maximum number of results to return")
     algorithm: Optional[Literal["rrf", "weighted"]] = Field(None, description="Hybrid fusion algorithm: 'rrf' or 'weighted'")
+
+    @field_validator("query")
+    @classmethod
+    def require_search_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Search query must contain non-whitespace text")
+        return value
 
 
 class SearchResultItem(BaseModel):
@@ -85,6 +92,19 @@ class HealthResponse(BaseModel):
     vector_backend: str
 
 
+def _cached_response(response_model, data, query: str, started: float):
+    if not data:
+        return None
+    try:
+        return response_model(**{
+            **data, "query": query, "cached": True,
+            "latency_ms": round((time.perf_counter() - started) * 1000.0, 2),
+        })
+    except ValidationError:
+        logger.warning("Ignoring invalid cached search response")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Lifespan Management
 # ---------------------------------------------------------------------------
@@ -92,8 +112,9 @@ class HealthResponse(BaseModel):
 async def lifespan(app: FastAPI):
     async with AsyncExitStack() as resources:
         # Register before startup so partially initialized resources also close.
-        # The stack runs every callback even if another callback raises.
-        for closer in (close_embedding_clients, close_cache, close_es_client, close_db_pool):
+        # The stack runs every callback even if another callback raises. It
+        # unwinds in reverse, so stop generation before clearing its cache.
+        for closer in (close_db_pool, close_es_client, close_cache, close_embedding_clients):
             resources.push_async_callback(closer)
 
         logger.info("Starting up xf-openai-embed service...")
@@ -139,11 +160,9 @@ async def search_endpoint(request: QueryRequest):
     cache_key = compute_search_cache_key(request.query, "vector", request.max_results)
 
     cached_data = await get_cached_search_results(cache_key)
-    if cached_data:
-        latency = (time.perf_counter() - t0) * 1000.0
-        return VectorSearchResponse(**{
-            **cached_data, "query": request.query, "cached": True, "latency_ms": round(latency, 2),
-        })
+    cached_response = _cached_response(VectorSearchResponse, cached_data, request.query, t0)
+    if cached_response is not None:
+        return cached_response
 
     try:
         results = await perform_vector_search(request.query, max_results=request.max_results)
@@ -174,11 +193,9 @@ async def elastic_endpoint(request: QueryRequest):
     cache_key = compute_search_cache_key(request.query, "elastic", request.max_results)
 
     cached_data = await get_cached_search_results(cache_key)
-    if cached_data:
-        latency = (time.perf_counter() - t0) * 1000.0
-        return ElasticSearchResponse(**{
-            **cached_data, "query": request.query, "cached": True, "latency_ms": round(latency, 2),
-        })
+    cached_response = _cached_response(ElasticSearchResponse, cached_data, request.query, t0)
+    if cached_response is not None:
+        return cached_response
 
     try:
         results = await search_elasticsearch(request.query, max_results=request.max_results)
@@ -209,11 +226,9 @@ async def combined_endpoint(request: QueryRequest):
     cache_key = compute_search_cache_key(request.query, "combined", request.max_results, request.algorithm)
 
     cached_data = await get_cached_search_results(cache_key)
-    if cached_data:
-        latency = (time.perf_counter() - t0) * 1000.0
-        return CombinedSearchResponse(**{
-            **cached_data, "query": request.query, "cached": True, "latency_ms": round(latency, 2),
-        })
+    cached_response = _cached_response(CombinedSearchResponse, cached_data, request.query, t0)
+    if cached_response is not None:
+        return cached_response
 
     try:
         fused, vec_hits, es_hits = await perform_hybrid_search(

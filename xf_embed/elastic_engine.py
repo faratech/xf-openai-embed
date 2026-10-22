@@ -1,5 +1,6 @@
 import logging
 import time
+from numbers import Integral
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from elasticsearch import AsyncElasticsearch
 from elasticsearch.helpers import async_bulk
@@ -109,70 +110,123 @@ def build_bm25_query_dsl(
     return search_dsl
 
 
+def _parse_search_hits(hits) -> List[Dict[str, Any]]:
+    results = []
+    for hit in hits:
+        source = hit.get("_source", {})
+        score = float(hit.get("_score") or 0.0)
+        hit_id = str(hit.get("_id", ""))
+        hit_type, _, hit_content_id = hit_id.rpartition("-")
+        item_type = source.get("type") or hit_type
+        if item_type not in ("post", "thread"):
+            continue
+        post_id = source.get("post_id") if item_type == "post" else None
+        thread_id = source.get("discussion_id") or source.get("thread")
+        try:
+            if item_type == "post":
+                post_id = int(post_id or (hit_content_id if hit_type == "post" else 0))
+                if post_id <= 0:
+                    continue
+            else:
+                thread_id = int(thread_id or (hit_content_id if hit_type == "thread" else 0))
+                if thread_id <= 0:
+                    continue
+            if thread_id is not None:
+                thread_id = int(thread_id)
+        except (ValueError, TypeError):
+            continue
+        results.append({
+            "type": item_type, "post_id": post_id, "thread_id": thread_id,
+            "thread_title": "", "message": "", "post_date": 0,
+            "score": score, "es_score": score,
+        })
+    return results
+
+
+def _search_identity(item):
+    return ("post", item["post_id"]) if item.get("post_id") else ("thread", item["thread_id"])
+
+
 async def search_elasticsearch(
     query: str,
     max_results: int = 10,
     index_name: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Executes keyword BM25 search in Elasticsearch.
-    """
+    """Retrieve ranked public items, replenishing stale candidates as needed."""
+    if isinstance(max_results, bool) or not isinstance(max_results, Integral) or max_results <= 0:
+        raise ValueError("max_results must be a positive integer")
     target_index = index_name or settings.ELASTICSEARCH_INDEX
-
     try:
         pool = await get_db_pool()
         visible_nodes = await guest_visible_node_ids(pool)
         if not visible_nodes:
             return []
         es = get_es_client()
-        dsl = build_bm25_query_dsl(query, max_results=max_results, visible_node_ids=visible_nodes)
+        page_size = min(max_results, 500)
+        dsl = build_bm25_query_dsl(query, max_results=page_size, visible_node_ids=visible_nodes)
+        dsl["track_total_hits"] = False
+        details_by_identity = {}
+
+        async def hydrate(hits, selected, results):
+            candidates = _parse_search_hits(hits)
+            unchecked = {}
+            for item in candidates:
+                identity = _search_identity(item)
+                if identity not in details_by_identity:
+                    unchecked.setdefault(identity, item)
+            if unchecked:
+                details = await fetch_details_for_posts_and_threads(
+                    pool, list(unchecked.values()), visible_node_ids=visible_nodes,
+                )
+                details_by_identity.update(dict.fromkeys(unchecked))
+                details_by_identity.update((_search_identity(item), item) for item in details)
+            for item in candidates:
+                identity = _search_identity(item)
+                detail = details_by_identity.get(identity)
+                if detail is not None and identity not in selected:
+                    selected.add(identity)
+                    results.append({**detail, "score": item["score"], "es_score": item["es_score"]})
+                    if len(results) == max_results:
+                        break
+
+        # Keep the common fully valid first page at one ES request. Only stale
+        # or duplicate candidates require a stable paginated snapshot.
         response = await es.search(index=target_index, body=dsl)
-        results = []
         hits = response.get("hits", {}).get("hits", [])
-        for hit in hits:
-            source = hit.get("_source", {})
-            score = float(hit.get("_score") or 0.0)
+        results = []
+        await hydrate(hits, set(), results)
+        if len(results) >= max_results or len(hits) < page_size:
+            return results
 
-            # Derive post_id or thread_id from id or source fields
-            hit_id = str(hit.get("_id", ""))
-            hit_type, _, hit_content_id = hit_id.rpartition("-")
-            item_type = source.get("type") or hit_type
-            if item_type not in ("post", "thread"):
-                continue
-            post_id = source.get("post_id") if item_type == "post" else None
-            thread_id = source.get("discussion_id") or source.get("thread")
-
+        # PIT supplies a unique implicit _shard_doc tiebreaker. search_after
+        # avoids the result-window limit and repeated growing OFFSET requests.
+        snapshot = await es.open_point_in_time(index=target_index, keep_alive="1m")
+        pit_id = snapshot["id"]
+        try:
+            dsl["size"] = min(max(max_results * 2, 20), 500)
+            results = []
+            selected = set()
+            previous_sort = None
+            while True:
+                dsl["pit"] = {"id": pit_id, "keep_alive": "1m"}
+                response = await es.search(body=dsl)
+                pit_id = response.get("pit_id", pit_id)
+                hits = response.get("hits", {}).get("hits", [])
+                await hydrate(hits, selected, results)
+                if len(results) >= max_results or len(hits) < dsl["size"]:
+                    return results
+                next_sort = hits[-1].get("sort")
+                if not isinstance(next_sort, list) or not next_sort or next_sort == previous_sort:
+                    raise RuntimeError("Elasticsearch pagination did not advance")
+                dsl["search_after"] = next_sort
+                previous_sort = next_sort
+        finally:
             try:
-                if item_type == "post":
-                    post_id = int(post_id or (hit_content_id if hit_type == "post" else 0))
-                    if post_id <= 0:
-                        continue
-                else:
-                    thread_id = int(thread_id or (hit_content_id if hit_type == "thread" else 0))
-                    if thread_id <= 0:
-                        continue
-                if thread_id is not None:
-                    thread_id = int(thread_id)
-            except (ValueError, TypeError):
-                continue
-
-            results.append({
-                "type": item_type,
-                "post_id": post_id,
-                "thread_id": thread_id,
-                "thread_title": source.get("title", ""),
-                "message": source.get("message", ""),
-                "post_date": source.get("date", 0),
-                "score": score,
-                "es_score": score,
-            })
-        # ES may lag deletion, moderation, permission or content edits. Refresh
-        # and authorize candidates in one batch before any caller can cache them.
-        return await fetch_details_for_posts_and_threads(pool, results, visible_node_ids=visible_nodes)
+                await es.close_point_in_time(id=pit_id)
+            except Exception:
+                logger.warning("Could not close Elasticsearch search snapshot", exc_info=True)
     except Exception as e:
         logger.error(f"Elasticsearch search failed on index '{target_index}': {e}")
-        # A backend outage is not a valid empty result: callers must not cache
-        # it as a successful search for SEARCH_RESULT_CACHE_TTL.
         raise
 
 

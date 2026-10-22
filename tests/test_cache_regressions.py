@@ -133,7 +133,75 @@ def test_corrupt_search_entry_does_not_close_healthy_redis(monkeypatch):
     asyncio.run(run())
 
 
-def test_cached_search_rechecks_all_views_once_and_keeps_ranking(monkeypatch):
+@pytest.mark.parametrize('data', [
+    {'combined_results': [1], 'count': 1},
+    {'combined_results': 'broken', 'count': 1},
+    {'combined_results': {}, 'count': 0},
+    {'combined_results': None, 'count': 0},
+    {'combined_results': [{'post_id': 'broken'}], 'count': 1},
+    {'combined_results': [{'post_id': True}], 'count': 1},
+    {'combined_results': [{'post_id': -1}], 'count': 1},
+    {'combined_results': [{'message': 'content without an identity'}], 'count': 1},
+    {'combined_results': [], 'count': None},
+    {'combined_results': [{'post_id': 1, 'score': float('nan')}], 'count': 1},
+    {'combined_results': [{'post_id': 1, 'score': 'bad'}], 'count': 1},
+    {'combined_results': [{'post_id': 1, 'message': ['broken']}], 'count': 1},
+    {'combined_results': [{'post_id': 1, 'ranks': []}], 'count': 1},
+    {'combined_results': [{'post_id': 1, 'post_date': 'bad'}], 'count': 1},
+    {'combined_results': [], 'algorithm': 'bad', 'count': 0},
+    {'combined_results': [], 'latency_ms': 'bad', 'count': 0},
+    {'combined_results': [], 'query': [], 'count': 0},
+    {'combined_results': []},
+    {'combined_results': [], 'count': 1},
+])
+def test_malformed_json_search_payload_is_a_miss_before_promotion(data, monkeypatch):
+    from xf_embed import db
+    async def run():
+        redis = FakeRedis({'xf_embed:search:test': (json.dumps(data).encode(), 30000)})
+        monkeypatch.setattr(cache, 'get_redis_client', AsyncMock(return_value=redis))
+        monkeypatch.setattr(cache, '_validate_search_results', real_validate_search_results)
+        pool = AsyncMock(side_effect=AssertionError('Malformed cache must not reach the database'))
+        monkeypatch.setattr(db, 'get_db_pool', pool)
+        assert await cache.get_cached_search_results('test') is None
+        assert 'res:test' not in cache._local_memory_cache
+        redis.aclose.assert_not_awaited()
+        pool.assert_not_awaited()
+    asyncio.run(run())
+
+
+def test_malformed_memory_search_payload_is_evicted(monkeypatch):
+    async def run():
+        payload = {'combined_results': [1], 'count': 1}
+        cache._memory_put('res:test', {'data': payload}, 60)
+        validate = AsyncMock(side_effect=AssertionError('Malformed cache must not be validated'))
+        monkeypatch.setattr(cache, '_validate_search_results', validate)
+        assert await cache.get_cached_search_results('test') is None
+        assert 'res:test' not in cache._local_memory_cache
+        validate.assert_not_awaited()
+    asyncio.run(run())
+
+
+def test_invalid_search_payload_is_not_written(monkeypatch):
+    async def run():
+        redis = AsyncMock()
+        monkeypatch.setattr(cache, 'get_redis_client', AsyncMock(return_value=redis))
+        await cache.cache_search_results('test', {'combined_results': [1], 'count': 1})
+        assert 'res:test' not in cache._local_memory_cache
+        redis.set.assert_not_awaited()
+    asyncio.run(run())
+
+
+def test_empty_search_payloads_remain_cacheable(monkeypatch):
+    async def run():
+        monkeypatch.setattr(cache, '_validate_search_results', real_validate_search_results)
+        payload = {'combined_results': [], 'vector_results': None,
+                   'elasticsearch_results': None, 'count': 0}
+        await cache.cache_search_results('test', payload)
+        assert await cache.get_cached_search_results('test') == payload
+    asyncio.run(run())
+
+
+def test_cached_search_is_a_miss_when_primary_results_are_removed(monkeypatch):
     from xf_embed import db
     async def run():
         payload = {'combined_results': [{'post_id': 1, 'message': 'stale', 'score': .8},
@@ -148,12 +216,67 @@ def test_cached_search_rechecks_all_views_once_and_keeps_ranking(monkeypatch):
         result = await cache.get_cached_search_results('test')
         hydrate.assert_awaited_once()
         assert len(hydrate.call_args.args[1]) == 2
+        assert result is None
+        assert payload['count'] == 2
+    asyncio.run(run())
+
+
+def test_cached_search_refreshes_valid_primary_and_filters_secondary_views(monkeypatch):
+    from xf_embed import db
+    async def run():
+        payload = {'combined_results': [{'post_id': 1, 'message': 'stale', 'score': .8}],
+                   'vector_results': [{'post_id': 1, 'score': .9}],
+                   'elasticsearch_results': [{'post_id': 2, 'score': 8}], 'count': 1}
+        hydrate = AsyncMock(return_value=[{'post_id': 1, 'thread_id': 5, 'message': 'fresh'}])
+        monkeypatch.setattr(db, 'get_db_pool', AsyncMock(return_value=object()))
+        monkeypatch.setattr(db, 'fetch_details_for_posts_and_threads', hydrate)
+        monkeypatch.setattr(cache, '_validate_search_results', real_validate_search_results)
+        await cache.cache_search_results('test', payload)
+        result = await cache.get_cached_search_results('test')
+        hydrate.assert_awaited_once()
+        assert len(hydrate.call_args.args[1]) == 2
         assert result['count'] == 1
         assert result['combined_results'] == [{'post_id': 1, 'thread_id': 5, 'message': 'fresh', 'score': .8}]
         assert result['vector_results'][0]['score'] == .9
         assert result['elasticsearch_results'] == []
-        assert payload['count'] == 2
+        assert payload['combined_results'][0]['message'] == 'stale'
     asyncio.run(run())
+
+
+@pytest.mark.parametrize('mode', ['vector', 'elastic', 'combined'])
+def test_cached_primary_removal_refills_from_backend(monkeypatch, mode):
+    from fastapi.testclient import TestClient
+    from xf_embed import api, db
+    field, path, search_name = {
+        'vector': ('faiss_results', '/faiss/search/', 'perform_vector_search'),
+        'elastic': ('elasticsearch_results', '/faiss/elastic/', 'search_elasticsearch'),
+        'combined': ('combined_results', '/faiss/combined/', 'perform_hybrid_search'),
+    }[mode]
+    old = [{'post_id': 1, 'score': .9}, {'post_id': 2, 'score': .8}]
+    fresh = [{'post_id': 1, 'score': .9}, {'post_id': 3, 'score': .7}]
+    payload = {field: old, 'count': 2, 'query': 'query'}
+    if mode == 'combined':
+        payload['algorithm'] = 'rrf'
+    key = cache.compute_search_cache_key('query', mode, 2)
+    cache._memory_put(f'res:{key}', {'data': payload}, 60)
+    monkeypatch.setattr(cache, '_validate_search_results', real_validate_search_results)
+    monkeypatch.setattr(db, 'get_db_pool', AsyncMock(return_value=object()))
+    hydrate = AsyncMock(side_effect=[[{'post_id': 1}], fresh])
+    monkeypatch.setattr(db, 'fetch_details_for_posts_and_threads', hydrate)
+    monkeypatch.setattr(api, 'get_cached_search_results', cache.get_cached_search_results)
+    search = AsyncMock(return_value=(fresh, fresh, []) if mode == 'combined' else fresh)
+    monkeypatch.setattr(api, search_name, search)
+    client = TestClient(api.create_app())
+    first = client.post(path, json={'query': 'query', 'max_results': 2})
+    assert first.status_code == 200
+    assert first.json()['cached'] is False
+    assert [item['post_id'] for item in first.json()[field]] == [1, 3]
+    second = client.post(path, json={'query': 'query', 'max_results': 2})
+    assert second.status_code == 200
+    assert second.json()['cached'] is True
+    assert [item['post_id'] for item in second.json()[field]] == [1, 3]
+    search.assert_awaited_once()
+    assert hydrate.await_count == 2
 
 
 @pytest.mark.parametrize('raw', [b'null', b'[[1,2]]', b'[NaN]', b'"text"'])

@@ -49,6 +49,8 @@ async def create_index(es: AsyncElasticsearch, overwrite: bool = False):
             "properties": {
                 "post_id": {"type": "integer"},
                 "thread_id": {"type": "integer"},
+                "record_id": {"type": "integer"},
+                "section": {"type": "integer"},
                 "embedding": {"type": "dense_vector", "dims": EXPECTED_EMBEDDING_LENGTH},
                 "embedding_length": {"type": "integer"},
             }
@@ -67,7 +69,7 @@ async def fetch_data_from_mysql(pool, last_id: int):
         async with conn.cursor() as cursor:
             await cursor.execute(
                 """
-                SELECT id, post_id, thread_id, embedding, embedding_length
+                SELECT id, post_id, thread_id, embedding, embedding_length, section
                 FROM openai_embeddings
                 WHERE id > %s AND embedding IS NOT NULL
                 ORDER BY id ASC
@@ -97,7 +99,7 @@ async def process_data(pool, es: AsyncElasticsearch):
                 break
 
             actions = []
-            for rec_id, post_id, thread_id, embedding_blob, stored_length in data:
+            for rec_id, post_id, thread_id, embedding_blob, stored_length, section in data:
                 total_processed += 1
                 if not embedding_blob:
                     continue
@@ -120,7 +122,15 @@ async def process_data(pool, es: AsyncElasticsearch):
                 if post_id is None and thread_id is None:
                     continue
 
-                doc_id = f"post-{post_id}" if post_id else f"thread-{thread_id}"
+                if post_id is not None:
+                    doc_id = f"post-{post_id}"
+                    if section is None:
+                        # Nullable legacy sections have no compound uniqueness.
+                        doc_id += f"-record-{rec_id}"
+                    elif section != 0:
+                        doc_id += f"-section-{section}"
+                else:
+                    doc_id = f"thread-{thread_id}"
                 actions.append(
                     {
                         "_index": INDEX_NAME,
@@ -128,6 +138,8 @@ async def process_data(pool, es: AsyncElasticsearch):
                         "_source": {
                             "post_id": post_id,
                             "thread_id": thread_id,
+                            "record_id": rec_id,
+                            "section": section,
                             "embedding": embedding.tolist(),
                             "embedding_length": stored_length or len(embedding),
                         },

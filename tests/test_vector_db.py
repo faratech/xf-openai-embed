@@ -246,10 +246,10 @@ def test_search_keeps_loop_responsive_and_preserves_ranking(monkeypatch):
         def search(self, vector, top_k):
             assert threading.get_ident() != caller_thread
             np.testing.assert_array_equal(vector, [[1, 0, 0]])
-            assert top_k == 3
+            assert top_k == 2
             started.set()
             assert release.wait(timeout=2), "event loop was blocked by search"
-            return np.array([[0.9, 0.8, -1.0]]), np.array([[22, 11, -1]])
+            return np.array([[0.9, 0.8]]), np.array([[22, 11]])
 
     async def get_index():
         return Index()
@@ -279,6 +279,160 @@ def test_search_keeps_loop_responsive_and_preserves_ranking(monkeypatch):
     results = asyncio.run(run())
     assert [result["post_id"] for result in results] == [2, 1]
     assert [result["score"] for result in results] == [0.9, 0.8]
+
+
+@pytest.mark.parametrize("top_k", [0, -1, 1.5, True])
+def test_faiss_rejects_invalid_limits_before_loading_index(monkeypatch, top_k):
+    async def unexpected_index():
+        raise AssertionError("invalid limits must fail before loading an index")
+
+    monkeypatch.setattr(vector_engine, "get_faiss_index", unexpected_index)
+    with pytest.raises(ValueError, match="positive integer"):
+        asyncio.run(vector_engine.search_faiss(np.array([1, 0, 0]), top_k=top_k))
+
+
+@pytest.mark.parametrize("first_visible", [2049, 2051])
+def test_faiss_backfills_filtered_hits_without_rehydrating_records(monkeypatch, first_visible):
+    searches = []
+    hydrated = []
+
+    class Index:
+        ntotal = 2050
+
+        def search(self, vector, top_k):
+            searches.append(top_k)
+            ids = np.arange(1, top_k + 1, dtype=np.int64)
+            return np.array([1 - ids / 10000]), np.array([ids])
+
+    async def get_index():
+        return Index()
+
+    async def get_pool():
+        return object()
+
+    async def hydrate(pool, ids):
+        assert len(ids) <= 1000
+        hydrated.extend(ids)
+        return {rec_id: {"post_id": rec_id} for rec_id in ids if rec_id >= first_visible}
+
+    monkeypatch.setattr(vector_engine, "get_faiss_index", get_index)
+    monkeypatch.setattr(vector_engine, "get_db_pool", get_pool)
+    monkeypatch.setattr(db, "fetch_details_by_record_ids", hydrate)
+    results = asyncio.run(vector_engine.search_faiss(np.array([1, 0, 0]), top_k=2))
+    assert [result["post_id"] for result in results] == list(range(first_visible, 2051))
+    assert searches == [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 2050]
+    assert hydrated == list(range(1, 2051))
+
+
+def test_faiss_counts_unique_forum_items_and_retains_best_section(monkeypatch):
+    index = faiss.IndexIDMap2(faiss.IndexFlatIP(3))
+    index.add_with_ids(
+        np.array([[1, 0, 0], [.9, .4358899, 0], [.8, .6, 0], [.7, .7141428, 0]], dtype=np.float32),
+        np.array([1, 2, 3, 4], dtype=np.int64),
+    )
+    hydrated = []
+
+    async def get_index():
+        return index
+
+    async def get_pool():
+        return object()
+
+    async def hydrate(pool, ids):
+        hydrated.extend(ids)
+        details = {1: {"post_id": 7}, 2: {"post_id": 7}, 3: {"thread_id": 8}, 4: {"post_id": 9}}
+        return {rec_id: details[rec_id] for rec_id in ids}
+
+    monkeypatch.setattr(vector_engine, "get_faiss_index", get_index)
+    monkeypatch.setattr(vector_engine, "get_db_pool", get_pool)
+    monkeypatch.setattr(db, "fetch_details_by_record_ids", hydrate)
+    results = asyncio.run(vector_engine.search_faiss(np.array([1, 0, 0]), top_k=2))
+    assert [(result.get("post_id"), result.get("thread_id")) for result in results] == [(7, None), (None, 8)]
+    assert results[0]["score"] == 1.0
+    assert hydrated == [1, 2, 3, 4]
+
+
+def test_faiss_stops_hydrating_after_filling_unique_results(monkeypatch):
+    hydrated = []
+
+    class Index:
+        ntotal = 8192
+
+        def search(self, vector, top_k):
+            ids = np.arange(1, top_k + 1, dtype=np.int64)
+            return np.array([1 - ids / 10000]), np.array([ids])
+
+    async def get_index():
+        return Index()
+
+    async def get_pool():
+        return object()
+
+    async def hydrate(pool, ids):
+        assert len(ids) <= 1000
+        hydrated.extend(ids)
+        return {rec_id: {"post_id": rec_id} for rec_id in ids if rec_id >= 4097}
+
+    monkeypatch.setattr(vector_engine, "get_faiss_index", get_index)
+    monkeypatch.setattr(vector_engine, "get_db_pool", get_pool)
+    monkeypatch.setattr(db, "fetch_details_by_record_ids", hydrate)
+    results = asyncio.run(vector_engine.search_faiss(np.array([1, 0, 0]), top_k=3))
+    assert [result["post_id"] for result in results] == [4097, 4098, 4099]
+    assert len(hydrated) == len(set(hydrated))
+    assert max(hydrated) < Index.ntotal
+
+
+def test_faiss_exhaustion_skips_sentinels_and_returns_available_unique_items(monkeypatch):
+    class Index:
+        ntotal = 4
+
+        def search(self, vector, top_k):
+            assert top_k == self.ntotal
+            return np.array([[.9, .8, .7, -np.inf]]), np.array([[1, 2, 3, -1]])
+
+    async def get_index():
+        return Index()
+
+    async def get_pool():
+        return object()
+
+    async def hydrate(pool, ids):
+        assert ids == [1, 2, 3]
+        return {1: {"post_id": 7}, 2: {"post_id": 7}}
+
+    monkeypatch.setattr(vector_engine, "get_faiss_index", get_index)
+    monkeypatch.setattr(vector_engine, "get_db_pool", get_pool)
+    monkeypatch.setattr(db, "fetch_details_by_record_ids", hydrate)
+    results = asyncio.run(vector_engine.search_faiss(np.array([1, 0, 0]), top_k=10))
+    assert len(results) == 1
+    assert results[0]["post_id"] == 7
+    assert results[0]["score"] == .9
+
+
+@pytest.mark.parametrize("metric", ["cosine", "l2"])
+@pytest.mark.parametrize("index_type", ["flat", "hnsw"])
+def test_faiss_backfill_keeps_metric_order_for_real_indexes(monkeypatch, metric, index_type):
+    monkeypatch.setattr(vector_engine.settings, "FAISS_METRIC", metric)
+    monkeypatch.setattr(vector_engine.settings, "FAISS_INDEX_TYPE", index_type)
+    index = vector_engine.create_base_faiss_index(3)
+    vectors = np.array([[1, 0, 0], [.9, .4358899, 0], [.8, .6, 0], [.7, .7141428, 0]], dtype=np.float32)
+    index.add_with_ids(vectors, np.array([1, 2, 3, 4], dtype=np.int64))
+
+    async def get_index():
+        return index
+
+    async def get_pool():
+        return object()
+
+    async def hydrate(pool, ids):
+        return {rec_id: {"post_id": rec_id} for rec_id in ids if rec_id >= 3}
+
+    monkeypatch.setattr(vector_engine, "get_faiss_index", get_index)
+    monkeypatch.setattr(vector_engine, "get_db_pool", get_pool)
+    monkeypatch.setattr(db, "fetch_details_by_record_ids", hydrate)
+    results = asyncio.run(vector_engine.search_faiss(np.array([1, 0, 0]), top_k=2))
+    assert [result["post_id"] for result in results] == [3, 4]
+    assert results[0]["score"] > results[1]["score"]
 
 
 def test_disk_load_is_offloaded_and_shared(monkeypatch):
@@ -408,6 +562,32 @@ def test_native_metadata_includes_thread_titles_authors_and_parent_ids(metadata_
     assert [result["post_date"] for result in results] == [4, 2]
     assert [result["type"] for result in results] == ["post", "thread"]
     assert [result["score"] for result in results] == [0.9, 0.8]
+
+
+@pytest.mark.parametrize("top_k", [0, -1, 1.5, True])
+def test_native_rejects_invalid_limits_before_reading_permissions(monkeypatch, top_k):
+    async def unexpected_visibility(pool):
+        raise AssertionError("invalid limits must fail before reading permissions")
+
+    monkeypatch.setattr(db, "guest_visible_node_ids", unexpected_visibility)
+    with pytest.raises(ValueError, match="positive integer"):
+        asyncio.run(db.search_mariadb_native_vector(object(), np.array([1, 0, 0]), top_k=top_k))
+
+
+def test_native_limits_unique_items_and_computes_each_candidate_distance_once(metadata_pool):
+    connection = metadata_pool.connection.connection
+    connection.execute("INSERT INTO openai_embeddings VALUES (3, 7, NULL, '0.05')")
+    evaluated = []
+
+    def distance(stored, query):
+        evaluated.append(stored)
+        return float(stored)
+
+    connection.create_function("VEC_DISTANCE_COSINE", 2, distance)
+    results = asyncio.run(db.search_mariadb_native_vector(metadata_pool, np.array([1, 0, 0]), top_k=2))
+    assert [(result["post_id"], result["thread_id"]) for result in results] == [(7, 8), (None, 8)]
+    assert [result["distance"] for result in results] == [0.05, 0.2]
+    assert sorted(evaluated) == ['0.05', '0.1', '0.2']
 
 
 def add_hidden_content(pool):
