@@ -1,9 +1,10 @@
-from elasticsearch import Elasticsearch
+import asyncio
 import time
-from datetime import datetime
 
-# Elasticsearch setup
-es = Elasticsearch(["http://localhost:9200"])
+from xf_embed.config import settings
+from xf_embed.elastic_engine import search_elasticsearch as _search_elasticsearch
+from xf_embed.cli import _close_clients
+
 
 def build_query(query, max_results=10):
     # Convert "now" to an appropriate timestamp
@@ -51,17 +52,25 @@ def build_query(query, max_results=10):
     return search_dsl
 
 def search_elasticsearch(query, max_results=10):
-    search_body = build_query(query, max_results)
-    try:
-        response = es.search(index="wf_wf", body=search_body)
-        results = []
-        for hit in response['hits']['hits']:
-            source = hit['_source']
-            results.append(source)
-        return results
-    except Exception as e:
-        print(f"An error occurred during the Elasticsearch query: {e}")
-        return []
+    """Keep legacy source aliases while using the authorized common engine."""
+    async def run():
+        try:
+            results = await _search_elasticsearch(
+                query, max_results=max_results, index_name=settings.ELASTICSEARCH_INDEX,
+            )
+            return [{
+                "title": item.get("thread_title", ""),
+                "message": item.get("message", ""),
+                "date": item.get("post_date", 0),
+                "user": item.get("user_id"),
+                "discussion_id": item.get("thread_id"),
+                "node": item.get("node_id"),
+            } for item in results]
+        finally:
+            await _close_clients()
+
+    return asyncio.run(run())
+
 
 def main():
     query = input("Enter your search query: ")

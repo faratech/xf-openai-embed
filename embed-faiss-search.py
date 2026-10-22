@@ -35,10 +35,14 @@ def main():
         print("Empty query.")
         return
 
-    try:
-        results = asyncio.run(run_search(query, top_k=10))
-    finally:
-        asyncio.run(close_db_pool())
+    async def run():
+        try:
+            return await run_search(query, top_k=10)
+        finally:
+            from xf_embed.cli import _close_clients
+            await _close_clients()
+
+    results = asyncio.run(run())
 
     print(f"\nTop {len(results)} most similar results:\n" + "-" * 60)
     for r in results:

@@ -2,13 +2,14 @@ import os
 import asyncio
 import asyncmy.cursors
 import json
+import math
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
 from tqdm import tqdm
 import logging
 import tiktoken
 import argparse
-from tenacity import retry, wait_random_exponential, stop_after_attempt
+from tenacity import retry, retry_if_exception_type, wait_random_exponential, stop_after_attempt
 
 # Load environment variables
 from xf_embed.config import settings
@@ -18,7 +19,8 @@ if os.path.exists('/web/.env'):
     load_dotenv('/web/.config')
 
 # Initialize AsyncOpenAI with the API key
-openai = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+# Tenacity is the only retry layer; SDK retries would multiply each attempt.
+openai = AsyncOpenAI(api_key=settings.OPENAI_API_KEY, max_retries=0)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -35,32 +37,59 @@ MAX_CONCURRENT_REQUESTS = 10  # Adjust this based on your rate limits and system
 # Create a semaphore to limit concurrent requests
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-@retry(wait=wait_random_exponential(min=1, max=20), stop=stop_after_attempt(6))
-async def get_embedding(text: str, model="text-embedding-3-small") -> list[float]:
-    response = await openai.embeddings.create(input=[text], model=model)
-    return response.data[0].embedding
+MAX_BATCH_TOKENS = 300_000
+MAX_BATCH_INPUTS = 2048
 
-@retry(wait=wait_random_exponential(min=1, max=20), stop=stop_after_attempt(6))
-async def get_embedding_batch(texts: list[str], model="text-embedding-3-small") -> list[list[float]]:
-    try:
-        response = await openai.embeddings.create(
-            input=texts,
-            model=model
-        )
-        return [data.embedding for data in response.data]
-    except Exception as e:
-        logging.error(f"Error in get_embedding_batch: {e}")
-        raise
+
+@retry(
+    retry=retry_if_exception_type((APIConnectionError, APITimeoutError, InternalServerError, RateLimitError)),
+    wait=wait_random_exponential(min=1, max=20), stop=stop_after_attempt(6), reraise=True,
+)
+async def _request_embeddings(inputs, model):
+    return await openai.embeddings.create(input=inputs, model=model)
+
+
+async def get_embedding(text: str, model="text-embedding-3-small") -> list[float]:
+    return (await get_embedding_batch([text], model=model))[0]
+
+
+async def get_embedding_batch(texts, model="text-embedding-3-small") -> list[list[float]]:
+    # Token arrays avoid repeated tokenization and preserve exact truncation limits.
+    inputs = [(tokenizer.encode(text, disallowed_special=()) if isinstance(text, str) else text)[:MAX_TOKENS]
+              for text in texts]
+    if any(not tokens for tokens in inputs):
+        raise ValueError("Embedding inputs must not be empty")
+    embeddings = []
+    offset = 0
+    while offset < len(inputs):
+        end, tokens = offset, 0
+        while end < len(inputs) and end - offset < MAX_BATCH_INPUTS:
+            length = len(inputs[end])
+            if tokens + length > MAX_BATCH_TOKENS:
+                break
+            tokens += length
+            end += 1
+        response = await _request_embeddings(inputs[offset:end], model)
+        data = sorted(response.data, key=lambda item: item.index)
+        if [item.index for item in data] != list(range(end - offset)):
+            raise ValueError("Embedding response indexes do not match the requested inputs")
+        for item in data:
+            valid, reason = validate_embedding(item.embedding)
+            if not valid:
+                raise ValueError(f"Invalid embedding response: {reason}")
+        embeddings.extend(item.embedding for item in data)
+        offset = end
+    return embeddings
 
 async def get_db_pool():
     logging.info("Attempting to create database connection pool")
     try:
         pool = await asyncmy.create_pool(
-            host=os.getenv("MYSQL_HOST"),
-            port=int(os.getenv("MYSQL_PORT")),
-            user=os.getenv("MYSQL_USER"),
-            password=os.getenv("MYSQL_PASSWORD"),
-            db=os.getenv("MYSQL_DATABASE"),
+            host=settings.MYSQL_HOST,
+            port=settings.MYSQL_PORT,
+            user=settings.MYSQL_USER,
+            password=settings.MYSQL_PASSWORD,
+            db=settings.MYSQL_DATABASE,
             autocommit=False,
             pool_recycle=3600,
             maxsize=20
@@ -75,13 +104,13 @@ async def rebuild_database(pool):
     logging.info("Rebuilding the entire embeddings database...")
     async with pool.acquire() as conn:
         async with conn.cursor() as cursor:
-            await cursor.execute("DELETE FROM openai_embeddings WHERE thread_id IS NOT NULL")
+            await cursor.execute("DELETE FROM openai_embeddings WHERE thread_id IS NOT NULL AND post_id IS NULL")
             await conn.commit()
     logging.info("Database has been cleared. Now processing all thread titles...")
     await process_threads(pool)
 
 def count_tokens(text):
-    return len(tokenizer.encode(text))
+    return len(tokenizer.encode(text, disallowed_special=()))
 
 def validate_embedding(embedding):
     if embedding is None:
@@ -96,6 +125,11 @@ def validate_embedding(embedding):
         return False, f"Invalid type: {type(embedding)}"
     if len(embedding) != EXPECTED_EMBEDDING_LENGTH:
         return False, f"Invalid length: Expected {EXPECTED_EMBEDDING_LENGTH}, got {len(embedding)}"
+    if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+               for value in embedding):
+        return False, "Embedding coordinates must be finite numbers"
+    if not any(embedding):
+        return False, "Embedding must not be a zero vector"
     return True, "Valid"
 
 async def process_single_thread(pool, thread_id):
@@ -103,68 +137,62 @@ async def process_single_thread(pool, thread_id):
         async with conn.cursor() as cursor:
             await cursor.execute('SELECT title FROM xf_thread WHERE thread_id = %s', (thread_id,))
             result = await cursor.fetchone()
-            if not result:
-                logging.error(f"Thread ID {thread_id} not found")
-                return
-
-            title = result[0]
-            tokens = count_tokens(title)
-            if tokens > MAX_TOKENS:
-                truncated_title = tokenizer.decode(tokenizer.encode(title)[:MAX_TOKENS])
-                logging.info(f"Processing truncated thread ID {thread_id}")
-            else:
-                truncated_title = title
-                logging.info(f"Processing full thread ID {thread_id}")
-
-            embedding = await get_embedding(truncated_title)
-            is_valid, validation_message = validate_embedding(embedding)
-            if not is_valid:
-                logging.error(f"Invalid embedding for thread ID {thread_id}: {validation_message}")
-                return
-
-            # Convert to JSON for VEC_FromText
-            vector_json = '[' + ','.join(str(f) for f in embedding) + ']'
-
-            await cursor.execute('''
-                INSERT INTO openai_embeddings
-                (thread_id, embedding, embedding_length, is_truncated, section, last_updated)
-                VALUES (%s, VEC_FromText(%s), %s, %s, %s, NOW())
-                ON DUPLICATE KEY UPDATE
-                    embedding = VALUES(embedding),
-                    embedding_length = VALUES(embedding_length),
-                    is_truncated = VALUES(is_truncated)
-            ''', (thread_id, vector_json, len(embedding), tokens > MAX_TOKENS, 0))
-            await conn.commit()
-            logging.info(f"Processed thread ID {thread_id}")
+    if not result:
+        logging.error("Thread ID %s not found", thread_id)
+        return
+    await process_batch_with_semaphore(pool, [{'thread_id': thread_id, 'title': result[0]}])
 
 async def process_batch_with_semaphore(pool, batch):
-    async with semaphore:
-        titles = [thread['title'] for thread in batch]
-        embeddings = await get_embedding_batch(titles)
+    return await _process_batch(pool, batch, repair=False)
 
+
+async def _process_batch(pool, batch, repair=False):
+    async with semaphore:
+        prepared = []
+        seen = set()
+        for item in batch:
+            if item['thread_id'] in seen:
+                continue
+            seen.add(item['thread_id'])
+            tokens = tokenizer.encode(item['title'], disallowed_special=())
+            if not tokens:
+                logging.warning("Skipping empty title for thread_id %s", item['thread_id'])
+                continue
+            prepared.append((item, tokens[:MAX_TOKENS], len(tokens) > MAX_TOKENS))
+        if not prepared:
+            return 0
+        embeddings = await get_embedding_batch([tokens for _, tokens, _ in prepared])
+        if len(embeddings) != len(prepared):
+            raise ValueError("Embedding response count does not match the requested inputs")
+        for embedding in embeddings:
+            valid, reason = validate_embedding(embedding)
+            if not valid:
+                raise ValueError(f"Invalid embedding response: {reason}")
         async with pool.acquire() as conn:
             async with conn.cursor() as cursor:
-                for thread, embedding in zip(batch, embeddings):
-                    thread_id = thread['thread_id']
-                    tokens = count_tokens(thread['title'])
-                    is_truncated = tokens > MAX_TOKENS
-
-                    # Convert to JSON for VEC_FromText
-                    vector_json = '[' + ','.join(str(f) for f in embedding) + ']'
-
-                    await cursor.execute('''
-                        INSERT INTO openai_embeddings
-                        (thread_id, embedding, embedding_length, is_truncated, section, last_updated)
-                        VALUES (%s, VEC_FromText(%s), %s, %s, %s, NOW())
-                        ON DUPLICATE KEY UPDATE
-                            embedding = VALUES(embedding),
-                            embedding_length = VALUES(embedding_length),
-                            is_truncated = VALUES(is_truncated)
-                    ''', (thread_id, vector_json, len(embedding), is_truncated, 0))
-
+                for (item, _, is_truncated), embedding in zip(prepared, embeddings):
+                    vector_json = json.dumps(embedding, allow_nan=False)
+                    if repair:
+                        await cursor.execute('''
+                            UPDATE openai_embeddings
+                            SET embedding = VEC_FromText(%s), embedding_length = %s,
+                                is_truncated = %s, last_updated = NOW()
+                            WHERE thread_id = %s AND post_id IS NULL
+                        ''', (vector_json, len(embedding), is_truncated, item['thread_id']))
+                    else:
+                        await cursor.execute('''
+                            INSERT INTO openai_embeddings
+                            (thread_id, embedding, embedding_length, is_truncated, section, last_updated)
+                            VALUES (%s, VEC_FromText(%s), %s, %s, %s, NOW())
+                            ON DUPLICATE KEY UPDATE
+                                embedding = VALUES(embedding),
+                                embedding_length = VALUES(embedding_length),
+                                is_truncated = VALUES(is_truncated),
+                                last_updated = NOW()
+                        ''', (item['thread_id'], vector_json, len(embedding), is_truncated, 0))
                 await conn.commit()
-
-        logging.info(f"Processed batch of {len(batch)} threads")
+        logging.info("Processed %s%s threads", len(prepared), " repair" if repair else "")
+        return len(prepared)
 
 async def process_threads(pool):
     try:
@@ -172,7 +200,7 @@ async def process_threads(pool):
             async with conn.cursor() as cursor:
                 await cursor.execute('SELECT COUNT(*) FROM xf_thread')
                 total_threads = (await cursor.fetchone())[0]
-                await cursor.execute('SELECT COUNT(DISTINCT thread_id) FROM openai_embeddings')
+                await cursor.execute('SELECT COUNT(DISTINCT thread_id) FROM openai_embeddings WHERE post_id IS NULL')
                 completed_threads = (await cursor.fetchone())[0]
         pending_threads = total_threads - completed_threads
         logging.info(f"Total threads: {total_threads}, Completed: {completed_threads}, Pending: {pending_threads}")
@@ -185,12 +213,16 @@ async def process_threads(pool):
 
                 batches = [threads[i:i + BATCH_SIZE] for i in range(0, len(threads), BATCH_SIZE)]
                 tasks = [process_batch_with_semaphore(pool, batch) for batch in batches]
-                await asyncio.gather(*tasks)
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
 
                 pbar.update(len(threads))
 
     except Exception as e:
         logging.error(f"An error occurred: {e}")
+        raise
 
 async def fetch_threads(pool, last_processed_id, batch_size):
     async with pool.acquire() as conn:
@@ -198,7 +230,7 @@ async def fetch_threads(pool, last_processed_id, batch_size):
             await cursor.execute('''
                 SELECT t.thread_id, t.title
                 FROM xf_thread t
-                LEFT JOIN (SELECT DISTINCT thread_id FROM openai_embeddings) e ON t.thread_id = e.thread_id
+                LEFT JOIN openai_embeddings e ON t.thread_id = e.thread_id AND e.post_id IS NULL
                 WHERE e.thread_id IS NULL AND t.thread_id > %s
                 ORDER BY t.thread_id
                 LIMIT %s
@@ -208,114 +240,82 @@ async def fetch_threads(pool, last_processed_id, batch_size):
                 return [], last_processed_id
             return [{'thread_id': thread_id, 'title': title} for thread_id, title in threads], threads[-1][0]
 
+async def _fetch_embedding_rows(pool, last_id, batch_size, with_text=False):
+    text_column = ", x.title" if with_text else ""
+    join = "JOIN xf_thread x ON e.thread_id = x.thread_id" if with_text else ""
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(f'''
+                SELECT e.id, e.thread_id, VEC_ToText(e.embedding), e.embedding_length{text_column}
+                FROM openai_embeddings e {join}
+                WHERE e.thread_id IS NOT NULL AND e.post_id IS NULL AND e.id > %s
+                ORDER BY e.id
+                LIMIT %s
+            ''', (last_id, batch_size))
+            return await cursor.fetchall()
+
+
+async def _embedding_count(pool):
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute('SELECT COUNT(*) FROM openai_embeddings WHERE thread_id IS NOT NULL AND post_id IS NULL')
+            return (await cursor.fetchone())[0]
+
+
 async def check_embeddings(pool):
-    try:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cursor:
-                await cursor.execute('SELECT COUNT(*) FROM openai_embeddings WHERE thread_id IS NOT NULL')
-                total_embeddings = (await cursor.fetchone())[0]
-                issues_count = 0
-                with tqdm(total=total_embeddings, desc="Checking embeddings") as pbar:
-                    for offset in range(0, total_embeddings, 100):
-                        await cursor.execute(f'''
-                            SELECT thread_id, VEC_ToText(embedding) AS vec_text, embedding_length
-                            FROM openai_embeddings
-                            WHERE thread_id IS NOT NULL
-                            LIMIT {offset}, 100
-                        ''')
-                        batch = await cursor.fetchall()
-                        for thread_id, vec_text, stored_length in batch:
-                            if vec_text is None:
-                                logging.warning(f"Embedding is None for thread_id {thread_id}")
-                                issues_count += 1
-                                continue
-                            try:
-                                is_valid, message = validate_embedding(vec_text)
-                                if not is_valid or stored_length != EXPECTED_EMBEDDING_LENGTH:
-                                    issues_count += 1
-                                    logging.warning(f"Issue with thread_id {thread_id}: {message}")
-                            except ValueError as e:
-                                logging.error(f"Error processing embedding for thread_id {thread_id}: {e}")
-                                issues_count += 1
-                        pbar.update(len(batch))
-                logging.info(f"Checked {total_embeddings} embeddings. Found {issues_count} issues.")
-    except Exception as e:
-        logging.error(f"An error occurred during check: {e}")
+    total = await _embedding_count(pool)
+    issues_count, last_id = 0, 0
+    with tqdm(total=total, desc="Checking embeddings") as pbar:
+        while True:
+            batch = await _fetch_embedding_rows(pool, last_id, 100)
+            if not batch:
+                break
+            for rec_id, entity_id, vec_text, stored_length in batch:
+                valid, reason = validate_embedding(vec_text)
+                if not valid or stored_length != EXPECTED_EMBEDDING_LENGTH:
+                    issues_count += 1
+                    logging.warning("Issue with thread_id %s: %s", entity_id, reason)
+            last_id = batch[-1][0]
+            pbar.update(len(batch))
+    logging.info("Checked %s embeddings. Found %s issues.", total, issues_count)
+    return issues_count
+
 
 async def process_repair_batch_with_semaphore(pool, batch):
-    async with semaphore:
-        titles = [item['title'] for item in batch]
-        try:
-            embeddings = await get_embedding_batch(titles)
-        except Exception as e:
-            logging.error(f"Error getting embeddings from OpenAI: {e}")
-            return
+    return await _process_batch(pool, batch, repair=True)
 
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cursor:
-                for item, embedding in zip(batch, embeddings):
-                    thread_id = item['thread_id']
-                    tokens = count_tokens(item['title'])
-                    is_truncated = tokens > MAX_TOKENS
-
-                    # Convert to JSON for VEC_FromText
-                    vector_json = '[' + ','.join(str(f) for f in embedding) + ']'
-
-                    await cursor.execute('''
-                        UPDATE openai_embeddings
-                        SET embedding = VEC_FromText(%s), embedding_length = %s, is_truncated = %s, last_updated = NOW()
-                        WHERE thread_id = %s
-                    ''', (vector_json, len(embedding), is_truncated, thread_id))
-
-                await conn.commit()
-
-        logging.info(f"Processed repair batch of {len(batch)} threads")
 
 async def repair_embeddings(pool):
-    try:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cursor:
-                await cursor.execute('SELECT COUNT(*) FROM openai_embeddings WHERE thread_id IS NOT NULL')
-                total_embeddings = (await cursor.fetchone())[0]
-                repaired_count = 0
-                with tqdm(total=total_embeddings, desc="Repairing embeddings") as pbar:
-                    for offset in range(0, total_embeddings, BATCH_SIZE * MAX_CONCURRENT_REQUESTS):
-                        await cursor.execute(f'''
-                            SELECT openai_embeddings.thread_id, VEC_ToText(embedding) AS vec_text, embedding_length, title
-                            FROM openai_embeddings
-                            JOIN xf_thread ON openai_embeddings.thread_id = xf_thread.thread_id
-                            LIMIT {offset}, {BATCH_SIZE * MAX_CONCURRENT_REQUESTS}
-                        ''')
-                        batch = await cursor.fetchall()
-                        batch_to_repair = []
-                        for thread_id, vec_text, stored_length, title in batch:
-                            is_valid, validation_message = validate_embedding(vec_text)
-                            if not is_valid or stored_length != EXPECTED_EMBEDDING_LENGTH:
-                                logging.warning(f"Invalid embedding for thread_id {thread_id}: {validation_message}")
-                                tokens = count_tokens(title)
-                                if tokens > MAX_TOKENS:
-                                    title = tokenizer.decode(tokenizer.encode(title)[:MAX_TOKENS])
-                                batch_to_repair.append({'thread_id': thread_id, 'title': title})
-                                repaired_count += 1
-
-                        if batch_to_repair:
-                            repair_batches = [batch_to_repair[i:i + BATCH_SIZE] for i in range(0, len(batch_to_repair), BATCH_SIZE)]
-                            tasks = [process_repair_batch_with_semaphore(pool, repair_batch) for repair_batch in repair_batches]
-                            await asyncio.gather(*tasks)
-
-                        pbar.update(len(batch))
-
-                logging.info(f"Repaired {repaired_count} embeddings out of {total_embeddings} total.")
-    except Exception as e:
-        logging.error(f"An error occurred during repair: {e}")
-        raise  # Re-raise the exception for higher-level handling
+    total = await _embedding_count(pool)
+    repaired_count, last_id = 0, 0
+    with tqdm(total=total, desc="Repairing embeddings") as pbar:
+        while True:
+            batch = await _fetch_embedding_rows(pool, last_id, BATCH_SIZE * MAX_CONCURRENT_REQUESTS, with_text=True)
+            if not batch:
+                break
+            batch_to_repair = []
+            for rec_id, entity_id, vec_text, stored_length, text in batch:
+                valid, reason = validate_embedding(vec_text)
+                if not valid or stored_length != EXPECTED_EMBEDDING_LENGTH:
+                    logging.warning("Invalid embedding for thread_id %s: %s", entity_id, reason)
+                    batch_to_repair.append({'thread_id': entity_id, 'title': text})
+            tasks = [process_repair_batch_with_semaphore(pool, batch_to_repair[i:i+BATCH_SIZE])
+                     for i in range(0, len(batch_to_repair), BATCH_SIZE)]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+                repaired_count += result
+            last_id = batch[-1][0]
+            pbar.update(len(batch))
+    logging.info("Repaired %s embeddings out of %s total.", repaired_count, total)
+    return repaired_count
 
 async def main(args):
     logging.info("Starting main function")
     pool = await get_db_pool()
     if pool is None:
-        logging.error("Could not obtain database pool. Exiting.")
-        return
+        raise RuntimeError("Could not obtain database pool")
 
     try:
         if args.check:
@@ -335,6 +335,7 @@ async def main(args):
             await process_threads(pool)
     except Exception as e:
         logging.error(f"An error occurred during execution: {e}")
+        raise
     finally:
         logging.info("Closing database pool")
         pool.close()

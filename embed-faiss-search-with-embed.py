@@ -27,11 +27,14 @@ def main():
         print("Empty query.")
         return
 
-    try:
-        fused, vec_hits, es_hits = asyncio.run(run_hybrid(query, max_results=10))
-    finally:
-        asyncio.run(close_db_pool())
-        asyncio.run(close_es_client())
+    async def run():
+        try:
+            return await run_hybrid(query, max_results=10)
+        finally:
+            from xf_embed.cli import _close_clients
+            await _close_clients()
+
+    fused, vec_hits, es_hits = asyncio.run(run())
 
     print(f"\nTop {len(fused)} Combined Results (Ranked by Reciprocal Rank Fusion):\n" + "=" * 70)
     for idx, r in enumerate(fused, start=1):

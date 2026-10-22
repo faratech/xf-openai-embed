@@ -11,11 +11,13 @@ Modern, high-performance semantic and hybrid search solution for XenForo forums.
 
 - **True Hybrid Search (RRF)**: Merges semantic vector hits with Elasticsearch BM25 keywords via Reciprocal Rank Fusion ($k=60$) or weighted score fusion, replacing legacy sort-by-date logic.
 - **High-Throughput FAISS Indexing**: Uses `IndexIDMap2` with unit-normalized Inner Product (exact cosine similarity). Streams millions of rows from MySQL in batches without exhausting memory.
-- **FastAPI Modern Async Service**: Fully async backend powered by `aiomysql`, `AsyncElasticsearch`, and `AsyncOpenAI`. Includes automatic OpenAPI Swagger documentation (`/docs`) and `/health` monitoring.
+- **FastAPI Modern Async Service**: Async backend powered by `asyncmy`, `AsyncElasticsearch`, and `AsyncOpenAI`, with FAISS work offloaded from the request loop. Includes OpenAPI documentation (`/docs`) and `/health` monitoring.
 - **High-Speed Elasticsearch Bulk Indexing**: Ingests hundreds of thousands of documents via `elasticsearch.helpers.async_bulk` (50–100x faster than legacy single-document calls).
-- **MariaDB 12 Vector Search Backend**: Optional zero-RAM alternative using MariaDB 12 native `VEC_DISTANCE_COSINE()` queries.
+- **MariaDB 12 Vector Search Backend**: Optional backend using `VEC_DISTANCE_COSINE()` without loading a FAISS index into application memory.
 - **Interactive CLI (`xf-search`)**: Built with Typer and Rich for easy server management, index generation, terminal search queries, and latency benchmarking.
-- **Automated Test Suite**: Full `pytest` unit and integration test coverage.
+- **Guest Visibility**: Searches restrict results to visible posts/threads in forums readable by XenForo's guest permission combination. Missing permission authority fails closed. Cached hits recheck current permissions and content state.
+- **Bounded Caching**: Memory LRU and Redis TTL-aware promotion, model-specific vector keys, and shared in-flight embedding generation for identical requests.
+- **Automated Test Suite**: Offline regression tests cover search, caches, SQL hydration, maintenance scripts, CLI lifecycle, and PHP input handling.
 
 ---
 
@@ -59,7 +61,7 @@ flowchart TD
 
 ## Requirements
 
-- **Python**: 3.10+ (tested on Python 3.10 – 3.14)
+- **Python**: 3.10+ (regression suite currently verified on Python 3.14)
 - **Database**: MySQL 8.0+ or MariaDB 11.7+ / 12.x
 - **Search Engine**: Elasticsearch 7.x, 8.x, or 9.x (XenForo Enhanced Search compatible)
 - **OpenAI Account**: API key with access to `text-embedding-3-small` (or `text-embedding-3-large`)
@@ -70,7 +72,7 @@ flowchart TD
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/your-repo/xf-openai-embed.git
+   git clone https://github.com/faratech/xf-openai-embed.git
    cd xf-openai-embed
    ```
 
@@ -108,6 +110,17 @@ flowchart TD
    FAISS_INDEX_TYPE=flat
    FAISS_METRIC=cosine
    ```
+
+   XenForo's computed guest node permissions must be available in
+   `xf_permission_combination`, `xf_node`, and `xf_permission_cache_content`.
+   The guest combination is user `0` with group list `1`. Searches use only
+   forums whose permissions grant `view`, `viewOthers`, and `viewContent`.
+   A database/permission outage returns an error rather than caching empty results.
+
+   The optional local embedding daemon defaults to `text-embedding-3-small`;
+   set `LOCAL_EMBEDDING_MODEL` to its actual model if using another daemon.
+   Requests for a different configured model bypass that daemon. Legacy
+   XenForo vector keys are shared only for `text-embedding-3-small` at 1536 dimensions.
 
 ---
 
@@ -211,6 +224,12 @@ Existing cron jobs and external scripts continue to function:
 - `python embed-faiss-search.py '<query>'`: Standalone FAISS vector query.
 - `python embed-faiss-search-with-embed.py '<query>'`: Standalone RRF hybrid search.
 
+Post maintenance manages section `0`; thread maintenance manages title rows
+whose `post_id` is NULL. Rebuilds preserve the other entity's vectors and post
+sections. `create_tables.py` creates the appropriate compound/conditional unique
+keys for new tables; it does not migrate existing tables. Existing schemas need
+equivalent keys for safe upserts.
+
 ---
 
 ## Web Interface (`ai-search.php`)
@@ -226,8 +245,13 @@ An interactive PHP frontend is included at `ai-search.php`. It supports:
 ## Running Automated Tests
 
 ```bash
-pytest -v tests/
+python -m pip install -e '.[dev]'
+python -m pytest -v tests/
 ```
+
+Tests stub services and forbid network connections. They do not need a running
+database, Elasticsearch, Redis, or an OpenAI API key. PHP regression tests use
+fake cURL functions with the real extension disabled.
 
 ---
 

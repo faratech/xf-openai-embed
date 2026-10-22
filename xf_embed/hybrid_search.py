@@ -21,6 +21,12 @@ def compute_item_key(item: Dict[str, Any]) -> str:
     return f"rec:{item.get('record_id', item.get('thread_title', ''))}"
 
 
+def _merge_missing_fields(existing: Dict[str, Any], item: Dict[str, Any]) -> None:
+    for field in ("thread_title", "message", "username", "post_date", "thread_id"):
+        if not existing.get(field) and item.get(field):
+            existing[field] = item[field]
+
+
 def reciprocal_rank_fusion(
     ranked_lists: List[List[Dict[str, Any]]],
     k: int = 60,
@@ -45,10 +51,12 @@ def reciprocal_rank_fusion(
                 source_ranks[key] = {}
             else:
                 # Merge fields if missing (e.g. title or message from one source)
-                existing = item_lookup[key]
-                for f in ["thread_title", "message", "username", "post_date"]:
-                    if not existing.get(f) and item.get(f):
-                        existing[f] = item[f]
+                _merge_missing_fields(item_lookup[key], item)
+
+            # Multiple embedding records can resolve to the same forum item.
+            # A source contributes only its first (best) rank for that item.
+            if source_name in source_ranks[key]:
+                continue
 
             rrf_val = 1.0 / (k + rank)
             scores[key] += rrf_val
@@ -79,25 +87,31 @@ def weighted_score_fusion(
     def min_max_normalize(items: List[Dict[str, Any]], score_key: str = "score") -> Dict[str, float]:
         if not items:
             return {}
-        raw_scores = [float(it.get(score_key, 0.0)) for it in items]
-        min_s = min(raw_scores)
-        max_s = max(raw_scores)
-        span = max_s - min_s if max_s > min_s else 1.0
-        normalized = {}
+        scores: Dict[str, float] = {}
         for it in items:
             key = compute_item_key(it)
-            normalized[key] = (float(it.get(score_key, 0.0)) - min_s) / span
-        return normalized
+            score = float(it.get(score_key, 0.0))
+            scores[key] = max(scores.get(key, score), score)
+        min_s = min(scores.values())
+        max_s = max(scores.values())
+        if max_s == min_s:
+            # A singleton or tied source still supplies retrieval evidence.
+            return dict.fromkeys(scores, 1.0)
+        span = max_s - min_s
+        return {key: (score - min_s) / span for key, score in scores.items()}
 
     v_norm = min_max_normalize(vector_results, "score")
     e_norm = min_max_normalize(elastic_results, "es_score")
 
-    combined_keys = set(v_norm.keys()) | set(e_norm.keys())
+    combined_keys = list(v_norm)
+    combined_keys.extend(key for key in e_norm if key not in v_norm)
     item_lookup: Dict[str, Dict[str, Any]] = {}
     for it in vector_results + elastic_results:
         k = compute_item_key(it)
         if k not in item_lookup:
             item_lookup[k] = dict(it)
+        else:
+            _merge_missing_fields(item_lookup[k], it)
 
     fused = []
     for key in combined_keys:
@@ -135,19 +149,27 @@ async def perform_hybrid_search(
     then combines them using RRF or weighted score fusion.
     Returns (fused_results, vector_results, elastic_results).
     """
+    chosen_algo = settings.HYBRID_ALGORITHM if algorithm is None else algorithm
+    if chosen_algo not in ("rrf", "weighted"):
+        raise ValueError(f"Unsupported hybrid algorithm: {chosen_algo!r}")
+
     fetch_k = max(max_results * 2, 20)  # Fetch slightly more candidates for fusion
 
     # Run both vector search and Elasticsearch in parallel non-blocking async
     vector_task = asyncio.create_task(perform_vector_search(query, max_results=fetch_k))
     elastic_task = asyncio.create_task(search_elasticsearch(query, max_results=fetch_k))
 
-    vector_results, elastic_results = await asyncio.gather(
-        vector_task,
-        elastic_task,
-        return_exceptions=False,
-    )
-
-    chosen_algo = algorithm or settings.HYBRID_ALGORITHM
+    tasks = (vector_task, elastic_task)
+    try:
+        vector_results, elastic_results = await asyncio.gather(*tasks)
+    except BaseException:
+        # gather propagates one backend failure without stopping the other.
+        # Finish cancellation before the request returns or releases clients.
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
     if chosen_algo == "weighted":
         fused = weighted_score_fusion(vector_results, elastic_results, alpha=settings.HYBRID_ALPHA)

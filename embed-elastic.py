@@ -102,17 +102,22 @@ async def process_data(pool, es: AsyncElasticsearch):
                 if not embedding_blob:
                     continue
 
-                if isinstance(embedding_blob, (bytes, bytearray)):
-                    embedding = np.frombuffer(embedding_blob, dtype=np.float32)
-                elif isinstance(embedding_blob, str):
-                    try:
-                        embedding = np.array(json.loads(embedding_blob), dtype=np.float32)
-                    except Exception:
+                try:
+                    if isinstance(embedding_blob, (bytes, bytearray, memoryview)):
+                        if len(embedding_blob) != EXPECTED_EMBEDDING_LENGTH * 4:
+                            continue
+                        embedding = np.frombuffer(embedding_blob, dtype=np.float32)
+                    elif isinstance(embedding_blob, str):
+                        embedding = np.asarray(json.loads(embedding_blob), dtype=np.float32)
+                    else:
                         continue
-                else:
+                except (TypeError, ValueError, OverflowError):
                     continue
 
-                if len(embedding) != EXPECTED_EMBEDDING_LENGTH or not np.isfinite(embedding).all():
+                if (embedding.ndim != 1 or len(embedding) != EXPECTED_EMBEDDING_LENGTH
+                        or not np.isfinite(embedding).all() or not np.any(embedding)):
+                    continue
+                if post_id is None and thread_id is None:
                     continue
 
                 doc_id = f"post-{post_id}" if post_id else f"thread-{thread_id}"
@@ -137,8 +142,9 @@ async def process_data(pool, es: AsyncElasticsearch):
                     raise_on_error=False,
                 )
                 total_indexed += success
-                pbar.update(len(data))
-
+                if errors:
+                    raise RuntimeError(f"Elasticsearch bulk indexing failed for {len(errors)} documents")
+            pbar.update(len(data))
             last_id = data[-1][0]
 
     logging.info(f"Total documents processed: {total_processed}")

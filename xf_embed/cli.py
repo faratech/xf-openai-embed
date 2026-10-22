@@ -1,14 +1,34 @@
 import asyncio
-import json
-import logging
 import time
 from typing import Optional
+from enum import Enum
 import typer
 from rich.console import Console
 from rich.table import Table
 
 app = typer.Typer(help="xf-search: Semantic and Hybrid Search CLI for XenForo")
 console = Console()
+
+
+class SearchMode(str, Enum):
+    hybrid = "hybrid"
+    vector = "vector"
+    elastic = "elastic"
+
+
+async def _close_clients():
+    from xf_embed.db import close_db_pool
+    from xf_embed.elastic_engine import close_es_client
+    from xf_embed.cache import close_cache
+    from xf_embed.embeddings import close_embedding_clients
+    outcomes = await asyncio.gather(
+        close_db_pool(), close_es_client(), close_cache(), close_embedding_clients(),
+        return_exceptions=True,
+    )
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            raise outcome
+
 
 
 @app.command()
@@ -32,7 +52,7 @@ def serve(
 
 @app.command()
 def index_faiss(
-    batch_size: int = typer.Option(10000, help="Batch size for fetching vectors from MySQL"),
+    batch_size: int = typer.Option(10000, min=1, help="Batch size for fetching vectors from MySQL"),
     output_path: Optional[str] = typer.Option(None, help="Output path for FAISS index file"),
 ):
     """Build or rebuild the FAISS vector index by streaming from MySQL."""
@@ -48,7 +68,10 @@ def index_faiss(
         console.print(f"  Indexed [bold cyan]{total_count}[/bold cyan] vectors...")
 
     async def run():
-        await build_faiss_index(batch_size=batch_size, save_path=target_path, progress_callback=progress)
+        try:
+            await build_faiss_index(batch_size=batch_size, save_path=target_path, progress_callback=progress)
+        finally:
+            await _close_clients()
 
     asyncio.run(run())
     duration = time.time() - start_time
@@ -58,13 +81,14 @@ def index_faiss(
 @app.command()
 def search(
     query: str = typer.Argument(..., help="Search query string"),
-    mode: str = typer.Option("hybrid", help="Search mode: 'hybrid', 'vector', or 'elastic'"),
-    limit: int = typer.Option(10, help="Maximum number of results to display"),
+    mode: SearchMode = typer.Option(SearchMode.hybrid, help="Search mode: 'hybrid', 'vector', or 'elastic'"),
+    limit: int = typer.Option(10, min=1, help="Maximum number of results to display"),
 ):
     """Execute a test search query directly from the terminal."""
     from xf_embed.hybrid_search import perform_hybrid_search, perform_vector_search
     from xf_embed.elastic_engine import search_elasticsearch
 
+    mode = mode.value if isinstance(mode, SearchMode) else mode
     console.print(f"[bold yellow]Searching for:[/bold yellow] '{query}' (mode: {mode}, limit: {limit})")
 
     async def run():
@@ -79,10 +103,7 @@ def search(
             elapsed = (time.time() - t0) * 1000.0
             return results, elapsed
         finally:
-            from xf_embed.db import close_db_pool
-            from xf_embed.elastic_engine import close_es_client
-            await close_db_pool()
-            await close_es_client()
+            await _close_clients()
 
     results, latency_ms = asyncio.run(run())
 
@@ -99,7 +120,7 @@ def search(
         item_id = str(r.get("post_id") or r.get("thread_id") or "N/A")
         score_val = f"{r.get('score', 0.0):.4f}"
         title = r.get("thread_title") or "No title"
-        msg = r.get("message", "")
+        msg = r.get("message") or ""
         preview = f"[bold]{title}[/bold]\n{(msg[:120] + '...') if len(msg) > 120 else msg}".strip()
         table.add_row(str(idx), r.get("type", "post"), item_id, score_val, preview)
 
@@ -109,7 +130,7 @@ def search(
 @app.command()
 def benchmark(
     query: str = typer.Option("windows 11 update issue", help="Query string to benchmark"),
-    iterations: int = typer.Option(10, help="Number of benchmark iterations"),
+    iterations: int = typer.Option(10, min=1, help="Number of benchmark iterations"),
 ):
     """Benchmark latency of vector, elasticsearch, and hybrid search pipelines."""
     from xf_embed.hybrid_search import perform_hybrid_search, perform_vector_search
@@ -123,21 +144,24 @@ def benchmark(
         es_times = []
         hybrid_times = []
 
-        for i in range(iterations):
-            # Vector
-            t0 = time.perf_counter()
-            await perform_vector_search(query, max_results=10)
-            vec_times.append((time.perf_counter() - t0) * 1000.0)
+        try:
+            for i in range(iterations):
+                # Vector
+                t0 = time.perf_counter()
+                await perform_vector_search(query, max_results=10)
+                vec_times.append((time.perf_counter() - t0) * 1000.0)
 
-            # ES
-            t0 = time.perf_counter()
-            await search_elasticsearch(query, max_results=10)
-            es_times.append((time.perf_counter() - t0) * 1000.0)
+                # ES
+                t0 = time.perf_counter()
+                await search_elasticsearch(query, max_results=10)
+                es_times.append((time.perf_counter() - t0) * 1000.0)
 
-            # Hybrid
-            t0 = time.perf_counter()
-            await perform_hybrid_search(query, max_results=10)
-            hybrid_times.append((time.perf_counter() - t0) * 1000.0)
+                # Hybrid
+                t0 = time.perf_counter()
+                await perform_hybrid_search(query, max_results=10)
+                hybrid_times.append((time.perf_counter() - t0) * 1000.0)
+        finally:
+            await _close_clients()
 
         return vec_times, es_times, hybrid_times
 

@@ -1,17 +1,14 @@
-import os
-import mysql.connector
-from dotenv import load_dotenv
+import pymysql
+from xf_embed.config import settings
 
-# Load environment variables
-load_dotenv()
-load_dotenv('/web/.config')
-
-# Database connection parameters
+# Use the same loader and driver family as the search application.
 db_config = {
-    "host": os.getenv("MYSQL_HOST"),
-    "user": os.getenv("MYSQL_USER"),
-    "password": os.getenv("MYSQL_PASSWORD"),
-    "database": os.getenv("MYSQL_DATABASE"),
+    "host": settings.MYSQL_HOST,
+    "port": settings.MYSQL_PORT,
+    "user": settings.MYSQL_USER,
+    "password": settings.MYSQL_PASSWORD,
+    "database": settings.MYSQL_DATABASE,
+    "charset": settings.MYSQL_CHARSET,
 }
 
 # SQL to create the openai_embeddings table
@@ -27,33 +24,35 @@ CREATE TABLE IF NOT EXISTS openai_embeddings (
   last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   section INT(11) DEFAULT 0,
   needs_update TINYINT(1) DEFAULT 0,
+  thread_embedding_key INT(10) UNSIGNED GENERATED ALWAYS AS
+    (CASE WHEN post_id IS NULL THEN thread_id ELSE NULL END) VIRTUAL,
   PRIMARY KEY (id),
-  KEY post_id (post_id),
+  UNIQUE KEY post_id (post_id, section),
+  UNIQUE KEY uq_thread_embedding_key (thread_embedding_key),
   KEY thread_id (thread_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 """
 
 def setup_database():
+    # CREATE IF NOT EXISTS preserves existing tables; it never alters live keys.
+    conn = None
+    cursor = None
     try:
-        # Establish a database connection
-        conn = mysql.connector.connect(**db_config)
+        conn = pymysql.connect(**db_config)
         cursor = conn.cursor()
-
-        # Create the table
         cursor.execute(create_table_sql)
-        print("openai_embeddings table created successfully.")
-
-        # Commit the changes
         conn.commit()
-
-    except mysql.connector.Error as err:
+        print("openai_embeddings table created successfully.")
+    except pymysql.MySQLError as err:
         print(f"Error: {err}")
-
+        raise
     finally:
-        if conn.is_connected():
+        if cursor is not None:
             cursor.close()
+        if conn is not None:
             conn.close()
             print("Database connection closed.")
+
 
 if __name__ == "__main__":
     setup_database()

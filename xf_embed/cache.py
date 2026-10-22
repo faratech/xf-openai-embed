@@ -1,8 +1,11 @@
+import asyncio
+from collections import OrderedDict
 import hashlib
 import json
 import logging
 import time
 from typing import Any, Dict, Optional
+
 import numpy as np
 import redis.asyncio as aioredis
 
@@ -11,201 +14,291 @@ from xf_embed.config import settings
 logger = logging.getLogger(__name__)
 
 _redis_client: Optional[aioredis.Redis] = None
-_local_memory_cache: Dict[str, Dict[str, Any]] = {}
+_redis_lock = asyncio.Lock()
+_redis_retry_at = 0.0
+_REDIS_RETRY_DELAY = 5.0
+_local_memory_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
 _MEMORY_CACHE_MAX_SIZE = 2048
 
 
 def compute_query_hash(query: str) -> str:
-    """Computes MD5 hash of lowercased and stripped query string."""
-    norm = query.strip().lower().encode("utf-8")
-    return hashlib.md5(norm).hexdigest()
+    """Shared XenForo query hash; preserve its normalization contract."""
+    return hashlib.md5(query.strip().lower().encode("utf-8")).hexdigest()
+
+
+def _vector_cache_keys(query: str):
+    h = compute_query_hash(query)
+    qualified = f"v2:{settings.OPENAI_EMBEDDING_MODEL}:{settings.OPENAI_DIMENSIONS}:{h}"
+    # The historical XenForo namespace has no model metadata. Share only its
+    # established default embedding space; all other models are isolated.
+    keys = [f"xf_embed:qemb:{qualified}"]
+    if settings.OPENAI_EMBEDDING_MODEL == "text-embedding-3-small" and settings.OPENAI_DIMENSIONS == 1536:
+        keys.extend((f"xfai:qemb:{h}", f"xf:xfai:qemb:{h}", f"xf_embed:qemb:{h}"))
+    return f"qemb:{qualified}", keys
 
 
 def compute_search_cache_key(query: str, mode: str, max_results: int, algorithm: Optional[str] = None) -> str:
-    """Computes a unique cache key for a search request."""
-    key_str = f"{query.strip().lower()}|{mode}|{max_results}|{algorithm or ''}"
-    return hashlib.md5(key_str.encode("utf-8")).hexdigest()
+    # Include configuration that changes ranking and embedding spaces. Versioning
+    # also prevents serving results produced before metadata/fusion fixes.
+    key = ["v2", query.strip().lower(), mode, max_results, algorithm or settings.HYBRID_ALGORITHM,
+           settings.HYBRID_ALPHA, settings.RRF_K, settings.VECTOR_BACKEND,
+           settings.FAISS_METRIC, settings.FAISS_INDEX_PATH, settings.ELASTICSEARCH_INDEX,
+           settings.OPENAI_EMBEDDING_MODEL, settings.OPENAI_DIMENSIONS]
+    return hashlib.md5(json.dumps(key).encode("utf-8")).hexdigest()
+
+
+def _memory_get(key: str) -> Optional[Dict[str, Any]]:
+    entry = _local_memory_cache.get(key)
+    if entry is None:
+        return None
+    if entry["expires_at"] <= time.monotonic():
+        del _local_memory_cache[key]
+        return None
+    _local_memory_cache.move_to_end(key)
+    return entry
+
+
+def _memory_put(key: str, value: Dict[str, Any], ttl: float) -> None:
+    if ttl <= 0 or _MEMORY_CACHE_MAX_SIZE <= 0:
+        _local_memory_cache.pop(key, None)
+        return
+    _local_memory_cache.pop(key, None)
+    while len(_local_memory_cache) >= _MEMORY_CACHE_MAX_SIZE:
+        _local_memory_cache.popitem(last=False)
+    _local_memory_cache[key] = {**value, "expires_at": time.monotonic() + ttl}
+
+
+def _promotion_ttl(milliseconds: int, cap: float) -> float:
+    if milliseconds == -1:  # Source intentionally has no expiry.
+        return cap
+    return min(cap, max(0.0, milliseconds / 1000.0))
+
+
+async def _redis_failed(client: aioredis.Redis) -> None:
+    global _redis_client, _redis_retry_at
+    if _redis_client is client or _redis_client is None:
+        _redis_client = None
+        _redis_retry_at = time.monotonic() + _REDIS_RETRY_DELAY
+    try:
+        await client.aclose()
+    except Exception:
+        pass
 
 
 async def get_redis_client() -> Optional[aioredis.Redis]:
-    """Returns singleton Redis client if caching is enabled."""
+    """Share a pool and briefly back off after failure; memory stays available."""
     global _redis_client
-    if not settings.CACHE_ENABLED:
+    if not settings.CACHE_ENABLED or time.monotonic() < _redis_retry_at:
         return None
-
     if _redis_client is None:
-        try:
-            _redis_client = aioredis.Redis(
-                host=settings.REDIS_HOST,
-                port=settings.REDIS_PORT,
-                db=settings.REDIS_DB,
-                password=settings.REDIS_PASSWORD,
-                decode_responses=False,
-                socket_timeout=1.5,
+        async with _redis_lock:
+            if _redis_client is not None:
+                return _redis_client
+            if time.monotonic() < _redis_retry_at:
+                return None
+            client = aioredis.Redis(
+                host=settings.REDIS_HOST, port=settings.REDIS_PORT,
+                db=settings.REDIS_DB, password=settings.REDIS_PASSWORD,
+                decode_responses=False, socket_timeout=1.5,
                 socket_connect_timeout=1.5,
             )
-            await _redis_client.ping()
-            logger.info(f"Connected to Redis cache on {settings.REDIS_HOST}:{settings.REDIS_PORT} (DB {settings.REDIS_DB}).")
-        except Exception as e:
-            logger.warning(f"Could not connect to Redis ({e}). Using in-memory fallback cache.")
-            _redis_client = None
+            try:
+                await client.ping()
+            except asyncio.CancelledError:
+                await client.aclose()
+                raise
+            except Exception as exc:
+                await _redis_failed(client)
+                logger.warning("Could not connect to Redis; using memory cache: %s", exc)
+                return None
+            _redis_client = client
     return _redis_client
 
 
 async def close_cache() -> None:
-    """Closes Redis client."""
-    global _redis_client
-    if _redis_client is not None:
-        await _redis_client.aclose()
-        _redis_client = None
+    global _redis_client, _redis_retry_at
+    async with _redis_lock:
+        client, _redis_client = _redis_client, None
+        _redis_retry_at = 0.0
+        _local_memory_cache.clear()
+        if client is not None:
+            await client.aclose()
+
+
+def _decode_vector(raw: bytes) -> Optional[np.ndarray]:
+    try:
+        try:
+            values = json.loads(raw)
+        except (ValueError, UnicodeError):
+            import phpserialize
+            values = phpserialize.loads(raw)
+            if isinstance(values, dict):
+                values = [value for _, value in sorted(values.items())]
+        vector = np.asarray(values, dtype=np.float32)
+        if (vector.shape == (settings.OPENAI_DIMENSIONS,) and np.isfinite(vector).all()
+                and np.any(vector)):
+            return vector
+    except (ValueError, TypeError, ImportError, OverflowError):
+        pass
+    return None
 
 
 async def get_cached_query_vector(query: str) -> Optional[np.ndarray]:
-    """
-    Retrieves cached query embedding vector.
-    Tries Redis first (checking both xf:xfai:qemb: and xfai:qemb: prefixes),
-    then falls back to in-memory cache.
-    """
     if not settings.CACHE_ENABLED:
         return None
-
-    h = compute_query_hash(query)
-    now = time.time()
-
-    # Check in-memory cache first (0.01ms)
-    mem_key = f"qemb:{h}"
-    if mem_key in _local_memory_cache:
-        entry = _local_memory_cache[mem_key]
-        if entry["expires_at"] > now:
-            return entry["vector"]
-        else:
-            del _local_memory_cache[mem_key]
-
-    # Check Redis
-    r = await get_redis_client()
-    if r is not None:
+    mem_key, keys = _vector_cache_keys(query)
+    entry = _memory_get(mem_key)
+    if entry is not None:
+        return entry["vector"]
+    client = await get_redis_client()
+    if client is not None:
         try:
-            keys_to_try = [f"xfai:qemb:{h}", f"xf:xfai:qemb:{h}", f"xf_embed:qemb:{h}"]
-            raw_val = None
-            for k in keys_to_try:
-                raw_val = await r.get(k)
-                if raw_val:
-                    break
-
-            if raw_val:
-                vec = None
-                try:
-                    # Stored as JSON float array
-                    val = json.loads(raw_val.decode("utf-8"))
-                    vec = np.array(val, dtype=np.float32)
-                except Exception:
-                    try:
-                        # Stored as PHP serialized format by XenForo Doctrine Cache
-                        import phpserialize
-                        php_data = phpserialize.loads(raw_val, array_hook=list)
-                        if isinstance(php_data, list):
-                            if php_data and isinstance(php_data[0], tuple):
-                                vec = np.array([v for _, v in php_data], dtype=np.float32)
-                            else:
-                                vec = np.array(php_data, dtype=np.float32)
-                        elif isinstance(php_data, dict):
-                            vec = np.array([v for _, v in sorted(php_data.items())], dtype=np.float32)
-                    except Exception:
-                        vec = None
-
-                if vec is not None and len(vec) == settings.OPENAI_DIMENSIONS:
-                    # Populate in-memory cache for subsequent instant hits
-                    _local_memory_cache[mem_key] = {"vector": vec, "expires_at": now + 600}
-                    return vec
-        except Exception as e:
-            logger.warning(f"Redis get_cached_query_vector failed: {e}")
-
+            # Read value and remaining lifetime together in one round trip.
+            async with client.pipeline(transaction=False) as pipe:
+                for key in keys:
+                    pipe.get(key)
+                    pipe.pttl(key)
+                values = await pipe.execute()
+            for raw, remaining in zip(values[::2], values[1::2]):
+                ttl = _promotion_ttl(remaining, 600)
+                if raw and ttl > 0:
+                    vector = _decode_vector(raw)
+                    if vector is not None:
+                        _memory_put(mem_key, {"vector": vector}, ttl)
+                        return vector
+        except Exception as exc:
+            await _redis_failed(client)
+            logger.warning("Redis vector read failed: %s", exc)
     return None
 
 
 async def cache_query_vector(query: str, vector: np.ndarray, ttl: Optional[int] = None) -> None:
-    """
-    Caches query embedding vector in both in-memory and Redis caches.
-    """
     if not settings.CACHE_ENABLED:
         return
-
-    h = compute_query_hash(query)
-    target_ttl = ttl or settings.QUERY_VECTOR_CACHE_TTL
-    now = time.time()
-
-    # Store in memory
-    if len(_local_memory_cache) > _MEMORY_CACHE_MAX_SIZE:
-        _local_memory_cache.clear()
-    _local_memory_cache[f"qemb:{h}"] = {"vector": vector, "expires_at": now + min(target_ttl, 600)}
-
-    # Store in Redis
-    r = await get_redis_client()
-    if r is not None:
+    target_ttl = settings.QUERY_VECTOR_CACHE_TTL if ttl is None else ttl
+    if target_ttl <= 0:
+        return
+    mem_key, keys = _vector_cache_keys(query)
+    _memory_put(mem_key, {"vector": vector}, min(target_ttl, 600))
+    client = await get_redis_client()
+    if client is not None:
         try:
             json_bytes = json.dumps(vector.tolist()).encode("utf-8")
-            # Store under xf_embed and xfai:qemb namespace for mutual sharing
-            await r.set(f"xf_embed:qemb:{h}", json_bytes, ex=target_ttl)
-            await r.set(f"xfai:qemb:{h}", json_bytes, ex=target_ttl)
-
-            # Also serialize in PHP format for direct XenForo Doctrine Cache sharing
-            try:
-                import phpserialize
-                php_bytes = phpserialize.dumps(vector.tolist())
-                await r.set(f"xf:xfai:qemb:{h}", php_bytes, ex=target_ttl)
-            except Exception:
-                pass
-        except Exception as e:
-            logger.warning(f"Redis cache_query_vector failed: {e}")
+            async with client.pipeline(transaction=False) as pipe:
+                for key in keys:
+                    if key.startswith("xf:xfai:"):
+                        try:
+                            import phpserialize
+                            pipe.set(key, phpserialize.dumps(vector.tolist()), ex=target_ttl)
+                        except ImportError:
+                            pass
+                    else:
+                        pipe.set(key, json_bytes, ex=target_ttl)
+                await pipe.execute()
+        except Exception as exc:
+            await _redis_failed(client)
+            logger.warning("Redis vector write failed: %s", exc)
 
 
 async def get_cached_search_results(cache_key: str) -> Optional[Dict[str, Any]]:
-    """Retrieves cached search results from Redis or in-memory."""
     if not settings.CACHE_ENABLED:
         return None
-
-    now = time.time()
     mem_key = f"res:{cache_key}"
-    if mem_key in _local_memory_cache:
-        entry = _local_memory_cache[mem_key]
-        if entry["expires_at"] > now:
-            return entry["data"]
-        else:
-            del _local_memory_cache[mem_key]
-
-    r = await get_redis_client()
-    if r is not None:
+    entry = _memory_get(mem_key)
+    if entry is not None:
+        return await _validate_search_results(entry["data"])
+    client = await get_redis_client()
+    if client is not None:
         try:
-            redis_key = f"xf_embed:search:{cache_key}"
-            raw = await r.get(redis_key)
-            if raw:
-                data = json.loads(raw.decode("utf-8"))
-                _local_memory_cache[mem_key] = {"data": data, "expires_at": now + 60}
-                return data
-        except Exception as e:
-            logger.warning(f"Redis get_cached_search_results failed: {e}")
-
+            key = f"xf_embed:search:{cache_key}"
+            async with client.pipeline(transaction=False) as pipe:
+                pipe.get(key)
+                pipe.pttl(key)
+                raw, remaining = await pipe.execute()
+            ttl = _promotion_ttl(remaining, 60)
+            if raw and ttl > 0:
+                try:
+                    data = json.loads(raw)
+                except (ValueError, UnicodeError, TypeError):
+                    # A damaged entry is a miss, not a connection outage.
+                    return None
+                if isinstance(data, dict):
+                    _memory_put(mem_key, {"data": data}, ttl)
+                    # Keep database failures outside Redis error handling.
+                    redis_data = data
+                else:
+                    redis_data = None
+            else:
+                redis_data = None
+        except Exception as exc:
+            await _redis_failed(client)
+            logger.warning("Redis search read failed: %s", exc)
+            redis_data = None
+        if redis_data is not None:
+            return await _validate_search_results(redis_data)
     return None
 
 
+async def _validate_search_results(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Recheck current guest visibility/state on every cache hit in one batch.
+
+    Post deletion/moderation and permission changes do not necessarily change
+    search cache keys. Cached bodies are never an authority for access.
+    """
+    fields = ("faiss_results", "combined_results", "vector_results", "elasticsearch_results")
+    items = {}
+
+    def identity(item):
+        if item.get("post_id"):
+            return ("post", int(item["post_id"]))
+        if item.get("thread_id"):
+            return ("thread", int(item["thread_id"]))
+        return None
+
+    for field in fields:
+        for item in data.get(field) or []:
+            key = identity(item)
+            if key is not None:
+                items[key] = item
+    if not items:
+        return data
+    from xf_embed.db import fetch_details_for_posts_and_threads, get_db_pool
+    from xf_embed.visibility import VisibilityUnavailable
+    try:
+        pool = await get_db_pool()
+    except Exception as exc:
+        raise VisibilityUnavailable("Could not verify cached search permissions") from exc
+    details = await fetch_details_for_posts_and_threads(pool, list(items.values()))
+    permitted = {identity(item): item for item in details}
+    validated = dict(data)
+    content_fields = ("type", "post_id", "thread_id", "thread_title", "message", "post_date", "username", "user_id", "node_id")
+    for field in fields:
+        if data.get(field) is None:
+            continue
+        refreshed = []
+        for item in data[field]:
+            details = permitted.get(identity(item))
+            if details is not None:
+                refreshed.append({**item, **{key: details[key] for key in content_fields if key in details}})
+        validated[field] = refreshed
+    primary = next((field for field in ("combined_results", "faiss_results", "elasticsearch_results")
+                    if field in validated), None)
+    if primary is not None:
+        validated["count"] = len(validated[primary])
+    return validated
+
+
 async def cache_search_results(cache_key: str, data: Dict[str, Any], ttl: Optional[int] = None) -> None:
-    """Caches search results in Redis and in-memory."""
     if not settings.CACHE_ENABLED:
         return
-
-    target_ttl = ttl or settings.SEARCH_RESULT_CACHE_TTL
-    now = time.time()
-
-    mem_key = f"res:{cache_key}"
-    if len(_local_memory_cache) > _MEMORY_CACHE_MAX_SIZE:
-        _local_memory_cache.clear()
-    _local_memory_cache[mem_key] = {"data": data, "expires_at": now + min(target_ttl, 60)}
-
-    r = await get_redis_client()
-    if r is not None:
+    target_ttl = settings.SEARCH_RESULT_CACHE_TTL if ttl is None else ttl
+    if target_ttl <= 0:
+        return
+    _memory_put(f"res:{cache_key}", {"data": data}, min(target_ttl, 60))
+    client = await get_redis_client()
+    if client is not None:
         try:
-            redis_key = f"xf_embed:search:{cache_key}"
-            encoded = json.dumps(data).encode("utf-8")
-            await r.set(redis_key, encoded, ex=target_ttl)
-        except Exception as e:
-            logger.warning(f"Redis cache_search_results failed: {e}")
+            await client.set(f"xf_embed:search:{cache_key}", json.dumps(data).encode("utf-8"), ex=target_ttl)
+        except Exception as exc:
+            await _redis_failed(client)
+            logger.warning("Redis search write failed: %s", exc)

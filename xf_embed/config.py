@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     # Local Embedding Microservice (port 8765)
     USE_LOCAL_EMBEDDING_SERVICE: bool = True
     LOCAL_EMBEDDING_URL: str = "http://127.0.0.1:8765"
+    LOCAL_EMBEDDING_MODEL: str = "text-embedding-3-small"
 
     # Redis & Multi-tier Caching Settings (shared with XFAI)
     CACHE_ENABLED: bool = True

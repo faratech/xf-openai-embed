@@ -164,14 +164,15 @@
         </header>
 
         <?php
-        $query = isset($_POST['query']) ? trim($_POST['query']) : '';
-        $mode = isset($_POST['mode']) ? $_POST['mode'] : 'combined';
+        $query = isset($_POST['query']) && is_string($_POST['query']) ? trim($_POST['query']) : '';
+        $mode = isset($_POST['mode']) && in_array($_POST['mode'], ['combined', 'vector', 'elastic'], true)
+            ? $_POST['mode'] : 'combined';
         $max_results = 10;
         $response = null;
         $results = [];
         $http_status = 0;
 
-        if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($query)) {
+        if ($_SERVER['REQUEST_METHOD'] === 'POST' && $query !== '') {
             $endpoint = ($mode === 'elastic') ? 'elastic/' : (($mode === 'vector') ? 'search/' : 'combined/');
             $url = 'http://127.0.0.1:8000/faiss/' . $endpoint;
 

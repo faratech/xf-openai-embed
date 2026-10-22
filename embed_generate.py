@@ -24,6 +24,10 @@ async def main():
         print(f"L2 Norm: {float((embedding**2).sum()) ** 0.5:.4f}")
     except Exception as e:
         print(f"Failed to generate embedding: {e}")
+        raise
+    finally:
+        from xf_embed.cli import _close_clients
+        await _close_clients()
 
 
 if __name__ == "__main__":

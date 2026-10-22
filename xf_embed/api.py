@@ -1,9 +1,10 @@
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from xf_embed.cache import (
@@ -16,9 +17,10 @@ from xf_embed.cache import (
 from xf_embed.config import settings
 from xf_embed.db import close_db_pool, get_db_pool
 from xf_embed.elastic_engine import close_es_client, get_es_client, search_elasticsearch
-from xf_embed.embeddings import close_httpx_client
+from xf_embed.embeddings import close_embedding_clients
 from xf_embed.hybrid_search import perform_hybrid_search, perform_vector_search
 from xf_embed.vector_engine import get_faiss_index
+from xf_embed.visibility import VisibilityUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +31,7 @@ logger = logging.getLogger(__name__)
 class QueryRequest(BaseModel):
     query: str = Field(..., min_length=1, description="Search query string")
     max_results: int = Field(10, ge=1, le=100, description="Maximum number of results to return")
-    algorithm: Optional[str] = Field(None, description="Hybrid fusion algorithm: 'rrf' or 'weighted'")
+    algorithm: Optional[Literal["rrf", "weighted"]] = Field(None, description="Hybrid fusion algorithm: 'rrf' or 'weighted'")
 
 
 class SearchResultItem(BaseModel):
@@ -88,36 +90,40 @@ class HealthResponse(BaseModel):
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting up xf-openai-embed service...")
-    # Initialize DB pool
-    try:
-        await get_db_pool()
-    except Exception as e:
-        logger.warning(f"Could not initialize DB pool at startup: {e}")
+    async with AsyncExitStack() as resources:
+        # Register before startup so partially initialized resources also close.
+        # The stack runs every callback even if another callback raises.
+        for closer in (close_embedding_clients, close_cache, close_es_client, close_db_pool):
+            resources.push_async_callback(closer)
 
-    # Check Redis cache
-    try:
-        await get_redis_client()
-    except Exception as e:
-        logger.warning(f"Could not initialize Redis client: {e}")
+        logger.info("Starting up xf-openai-embed service...")
+        # Initialize DB pool
+        try:
+            await get_db_pool()
+        except Exception as e:
+            logger.warning(f"Could not initialize DB pool at startup: {e}")
 
-    # Warm up FAISS index if present
-    try:
-        idx = await get_faiss_index()
-        if idx:
-            logger.info(f"FAISS index loaded at startup with {idx.ntotal} vectors.")
-        else:
-            logger.info("FAISS index file not found on disk. MariaDB native vector or build needed.")
-    except Exception as e:
-        logger.warning(f"Could not load FAISS index at startup: {e}")
+        # Check Redis cache
+        try:
+            await get_redis_client()
+        except Exception as e:
+            logger.warning(f"Could not initialize Redis client: {e}")
 
-    yield
+        # MariaDB vector searches do not need a resident FAISS index.
+        if settings.VECTOR_BACKEND == "faiss":
+            try:
+                idx = await get_faiss_index()
+                if idx:
+                    logger.info(f"FAISS index loaded at startup with {idx.ntotal} vectors.")
+                else:
+                    logger.info("FAISS index file not found on disk. MariaDB native vector or build needed.")
+            except Exception as e:
+                logger.warning(f"Could not load FAISS index at startup: {e}")
 
-    logger.info("Shutting down xf-openai-embed service...")
-    await close_db_pool()
-    await close_es_client()
-    await close_cache()
-    await close_httpx_client()
+        try:
+            yield
+        finally:
+            logger.info("Shutting down xf-openai-embed service...")
 
 
 # ---------------------------------------------------------------------------
@@ -135,9 +141,9 @@ async def search_endpoint(request: QueryRequest):
     cached_data = await get_cached_search_results(cache_key)
     if cached_data:
         latency = (time.perf_counter() - t0) * 1000.0
-        cached_data["cached"] = True
-        cached_data["latency_ms"] = round(latency, 2)
-        return VectorSearchResponse(**cached_data)
+        return VectorSearchResponse(**{
+            **cached_data, "query": request.query, "cached": True, "latency_ms": round(latency, 2),
+        })
 
     try:
         results = await perform_vector_search(request.query, max_results=request.max_results)
@@ -151,11 +157,13 @@ async def search_endpoint(request: QueryRequest):
         )
         await cache_search_results(cache_key, resp.model_dump())
         return resp
-    except Exception as e:
+    except VisibilityUnavailable:
+        raise
+    except Exception:
         logger.exception("Vector search failed")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Vector search failed: {str(e)}"
+            detail="Vector search failed"
         )
 
 
@@ -168,9 +176,9 @@ async def elastic_endpoint(request: QueryRequest):
     cached_data = await get_cached_search_results(cache_key)
     if cached_data:
         latency = (time.perf_counter() - t0) * 1000.0
-        cached_data["cached"] = True
-        cached_data["latency_ms"] = round(latency, 2)
-        return ElasticSearchResponse(**cached_data)
+        return ElasticSearchResponse(**{
+            **cached_data, "query": request.query, "cached": True, "latency_ms": round(latency, 2),
+        })
 
     try:
         results = await search_elasticsearch(request.query, max_results=request.max_results)
@@ -184,11 +192,13 @@ async def elastic_endpoint(request: QueryRequest):
         )
         await cache_search_results(cache_key, resp.model_dump())
         return resp
-    except Exception as e:
+    except VisibilityUnavailable:
+        raise
+    except Exception:
         logger.exception("Elasticsearch search failed")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Elasticsearch query failed: {str(e)}"
+            detail="Elasticsearch query failed"
         )
 
 
@@ -201,9 +211,9 @@ async def combined_endpoint(request: QueryRequest):
     cached_data = await get_cached_search_results(cache_key)
     if cached_data:
         latency = (time.perf_counter() - t0) * 1000.0
-        cached_data["cached"] = True
-        cached_data["latency_ms"] = round(latency, 2)
-        return CombinedSearchResponse(**cached_data)
+        return CombinedSearchResponse(**{
+            **cached_data, "query": request.query, "cached": True, "latency_ms": round(latency, 2),
+        })
 
     try:
         fused, vec_hits, es_hits = await perform_hybrid_search(
@@ -224,11 +234,13 @@ async def combined_endpoint(request: QueryRequest):
         )
         await cache_search_results(cache_key, resp.model_dump())
         return resp
-    except Exception as e:
+    except VisibilityUnavailable:
+        raise
+    except Exception:
         logger.exception("Hybrid search failed")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Hybrid search failed: {str(e)}"
+            detail="Hybrid search failed"
         )
 
 
@@ -252,6 +264,13 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(router)
+
+    @app.exception_handler(VisibilityUnavailable)
+    async def visibility_unavailable(_request, _exc: VisibilityUnavailable):
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"detail": "Search visibility is temporarily unavailable"},
+        )
 
     @app.get("/health", response_model=HealthResponse, tags=["Monitoring"])
     async def healthcheck():
@@ -286,14 +305,15 @@ def create_app() -> FastAPI:
         except Exception:
             pass
 
-        # Check FAISS
-        try:
-            idx = await get_faiss_index()
-            if idx:
-                faiss_loaded = True
-                faiss_total = idx.ntotal
-        except Exception:
-            pass
+        # Only inspect the active backend; loading an unused index can be costly.
+        if settings.VECTOR_BACKEND == "faiss":
+            try:
+                idx = await get_faiss_index()
+                if idx:
+                    faiss_loaded = True
+                    faiss_total = idx.ntotal
+            except Exception:
+                pass
 
         overall_status = "healthy" if (db_ok and (faiss_loaded or settings.VECTOR_BACKEND == "mariadb")) else "degraded"
 

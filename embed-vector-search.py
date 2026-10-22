@@ -21,7 +21,8 @@ async def run_search(query: str, top_n: int = 10):
         results = await search_mariadb_native_vector(pool, vec, top_k=top_n)
         return results
     finally:
-        await close_db_pool()
+        from xf_embed.cli import _close_clients
+        await _close_clients()
 
 
 def main():

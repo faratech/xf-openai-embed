@@ -1,13 +1,14 @@
 import asyncio
 import logging
 import os
+import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 import faiss
 import numpy as np
 
 from xf_embed.config import settings
-from xf_embed.db import fetch_details_for_posts_and_threads, get_db_pool
+from xf_embed.db import get_db_pool
 from xf_embed.embeddings import normalize_vector
 
 logger = logging.getLogger(__name__)
@@ -40,9 +41,19 @@ def create_base_faiss_index(dimension: int) -> faiss.Index:
 
 
 def save_faiss_index(index: faiss.Index, path: Optional[str] = None) -> None:
-    filepath = path or settings.FAISS_INDEX_PATH
+    filepath = Path(path or settings.FAISS_INDEX_PATH)
     logger.info(f"Writing FAISS index to {filepath} (total vectors: {index.ntotal})...")
-    faiss.write_index(index, filepath)
+    # Keep the last usable index intact if writing fails or the process exits.
+    with tempfile.TemporaryDirectory(prefix=f".{filepath.name}.", dir=filepath.parent) as temporary_dir:
+        temporary_path = str(Path(temporary_dir) / filepath.name)
+        faiss.write_index(index, temporary_path)
+        if filepath.exists():
+            previous = filepath.stat()
+            os.chmod(temporary_path, previous.st_mode & 0o777)
+            current = os.stat(temporary_path)
+            if (current.st_uid, current.st_gid) != (previous.st_uid, previous.st_gid):
+                os.chown(temporary_path, previous.st_uid, previous.st_gid)
+        os.replace(temporary_path, filepath)
     logger.info(f"FAISS index successfully saved to {filepath}")
 
 
@@ -62,8 +73,14 @@ async def get_faiss_index() -> Optional[faiss.Index]:
     if _faiss_index is None:
         async with _index_lock:
             if _faiss_index is None:
-                _faiss_index = load_faiss_index_from_disk()
+                _faiss_index = await asyncio.to_thread(load_faiss_index_from_disk)
     return _faiss_index
+
+
+def _add_embeddings(index: faiss.Index, vectors: np.ndarray, record_ids: List[int]) -> None:
+    if settings.FAISS_METRIC == "cosine":
+        vectors = normalize_vector(vectors)
+    index.add_with_ids(vectors, np.asarray(record_ids, dtype=np.int64))
 
 
 async def build_faiss_index(
@@ -76,6 +93,8 @@ async def build_faiss_index(
     Memory-efficient: avoids loading all 680k+ embeddings into Python all at once.
     """
     global _faiss_index
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
     pool = await get_db_pool()
     dimension = settings.OPENAI_DIMENSIONS
     index = create_base_faiss_index(dimension)
@@ -93,23 +112,21 @@ async def build_faiss_index(
             batch_size=batch_size,
         )
 
-        if len(record_ids) == 0:
+        if next_last_id <= last_id:
             break
-
-        if settings.FAISS_METRIC == "cosine":
-            vectors = normalize_vector(vectors)
-
-        ids_array = np.array(record_ids, dtype=np.int64)
-        index.add_with_ids(vectors, ids_array)
-        total_added += len(record_ids)
         last_id = next_last_id
+        if not record_ids:
+            continue
+
+        await asyncio.to_thread(_add_embeddings, index, vectors, record_ids)
+        total_added += len(record_ids)
 
         if progress_callback:
             progress_callback(len(record_ids), total_added)
         else:
             logger.info(f"Indexed {total_added} vectors (latest DB id: {last_id})...")
 
-    save_faiss_index(index, save_path)
+    await asyncio.to_thread(save_faiss_index, index, save_path)
     async with _index_lock:
         _faiss_index = index
 
@@ -137,7 +154,7 @@ async def search_faiss(
     query_mat = np.ascontiguousarray(query_vector.reshape(1, -1), dtype=np.float32)
 
     # Perform FAISS search (C++ thread-safe execution)
-    distances, indices = index.search(query_mat, top_k)
+    distances, indices = await asyncio.to_thread(index.search, query_mat, top_k)
 
     scores = distances[0]
     record_ids = indices[0]
