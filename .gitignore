@@ -39,6 +39,7 @@ htmlcov/
 # FAISS and local indexes / logs
 *.bin
 *.faiss
+*.bin.state.json
 *.log
 
 # IDE
