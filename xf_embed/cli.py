@@ -80,25 +80,37 @@ def index_faiss(
 
 @app.command()
 def index_faiss_delta(
-    batch_size: int = typer.Option(10000, min=1, help="Batch size for fetching vectors from MySQL"),
+    batch_size: int = typer.Option(10000, min=1, help="Rows fetched per query"),
     output_path: Optional[str] = typer.Option(None, help="FAISS index file to update in place"),
+    since: Optional[str] = typer.Option(
+        None, help="Re-check rows changed since this UTC date/time (ISO 8601) instead of the state file",
+    ),
 ):
-    """Add the embeddings written since the index was built (no full rebuild, no API calls)."""
+    """Add new, re-add re-embedded and drop deleted embeddings (no full rebuild, no API calls)."""
+    from datetime import datetime, timezone
     from xf_embed.vector_engine import update_faiss_index_delta
     from xf_embed.config import settings
 
     target_path = output_path or settings.FAISS_INDEX_PATH
+    since_epoch = None
+    if since:
+        parsed = datetime.fromisoformat(since)
+        since_epoch = int((parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).timestamp())
     start_time = time.time()
 
     async def run():
         try:
-            return await update_faiss_index_delta(batch_size=batch_size, path=target_path)
+            return await update_faiss_index_delta(batch_size=batch_size, path=target_path, since=since_epoch)
         finally:
             await _close_clients()
 
-    start_id, added = asyncio.run(run())
-    # Machine-readable last line for the cron wrapper: it restarts the service only when added > 0.
-    console.print(f"FAISS_DELTA after_id={start_id} added={added} seconds={time.time() - start_time:.1f}")
+    r = asyncio.run(run())
+    # Machine-readable last line for the scheduler: it reloads the service only when something changed.
+    console.print(
+        f"FAISS_DELTA added={r['added']} updated={r['updated']} removed={r['removed']} invalid={r['invalid']} "
+        f"ntotal={r['ntotal']} since={r['since']} seconds={time.time() - start_time:.1f}",
+        soft_wrap=True,
+    )
 
 
 @app.command()

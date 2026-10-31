@@ -155,6 +155,13 @@ def test_build_continues_after_invalid_page_and_offloads_cpu_and_save(monkeypatc
     monkeypatch.setattr(db, "fetch_embeddings_batch", fetch)
     monkeypatch.setattr(vector_engine, "create_base_faiss_index", lambda _: Index())
     monkeypatch.setattr(vector_engine, "save_faiss_index", save)
+    states = []
+
+    async def now(pool):
+        return 1_800_000_000
+
+    monkeypatch.setattr(db, "db_unix_now", now)
+    monkeypatch.setattr(vector_engine, "write_index_state", lambda path, since, ntotal: states.append((path, since, ntotal)))
     index = asyncio.run(vector_engine.build_faiss_index(
         batch_size=2, save_path="unused.bin", progress_callback=lambda *args: progress.append(args),
     ))
@@ -162,6 +169,7 @@ def test_build_continues_after_invalid_page_and_offloads_cpu_and_save(monkeypatc
     assert vector_engine._faiss_index is index
     assert cursors == [0, 2, 3]
     assert progress == [(1, 1)]
+    assert states == [("unused.bin", 1_800_000_000 - vector_engine.STATE_MARGIN_S, 1)], "a full build records its start"
 
 
 def test_pool_initialization_is_single_flight(monkeypatch):

@@ -111,6 +111,54 @@ async def fetch_embeddings_batch(
     return await asyncio.to_thread(_decode_embeddings_batch, rows, last_id, settings.OPENAI_DIMENSIONS)
 
 
+async def db_unix_now(pool: asyncmy.Pool) -> int:
+    """The database's own clock, so change watermarks compare against the same clock as last_updated."""
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT UNIX_TIMESTAMP()")
+            row = await cursor.fetchone()
+    return int(row[0])
+
+
+async def fetch_embedding_ids(pool: asyncmy.Pool) -> np.ndarray:
+    """Every record id in openai_embeddings (a covering secondary-index scan)."""
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT id FROM openai_embeddings")
+            rows = await cursor.fetchall()
+    return np.fromiter((int(r[0]) for r in rows), dtype=np.int64, count=len(rows))
+
+
+async def fetch_ids_updated_since(pool: asyncmy.Pool, since_epoch: int) -> np.ndarray:
+    """Record ids whose row changed (re-embedded in place, or any other UPDATE) at or after since_epoch."""
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT id FROM openai_embeddings WHERE last_updated >= FROM_UNIXTIME(%s)", (int(since_epoch),),
+            )
+            rows = await cursor.fetchall()
+    return np.fromiter((int(r[0]) for r in rows), dtype=np.int64, count=len(rows))
+
+
+async def fetch_embeddings_by_ids(
+    pool: asyncmy.Pool, record_ids: List[int],
+) -> Tuple[List[int], List[Optional[int]], List[Optional[int]], np.ndarray, int]:
+    """Fetch and validate the given rows, with the same decoding as fetch_embeddings_batch."""
+    ids = [int(i) for i in record_ids]
+    if not ids:
+        return [], [], [], np.empty((0, settings.OPENAI_DIMENSIONS), dtype=np.float32), 0
+    placeholders = ",".join(["%s"] * len(ids))
+    query = (
+        "SELECT id, post_id, thread_id, embedding FROM openai_embeddings "
+        f"WHERE id IN ({placeholders}) AND embedding IS NOT NULL ORDER BY id ASC"
+    )
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(query, tuple(ids))
+            rows = await cursor.fetchall()
+    return await asyncio.to_thread(_decode_embeddings_batch, rows, 0, settings.OPENAI_DIMENSIONS)
+
+
 async def fetch_details_for_posts_and_threads(
     pool: asyncmy.Pool,
     items: List[Dict[str, Any]],

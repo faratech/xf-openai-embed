@@ -4,11 +4,23 @@ import socket
 from unittest.mock import AsyncMock
 
 import pytest
+import tiktoken
+
+# A byte-level tokenizer with tiktoken's real encode/decode and special-token handling, so token
+# counting and truncation run offline. tiktoken would otherwise download cl100k_base on a machine
+# whose cache lacks it; the guard below refuses that, and generate_embedding() then fails before
+# its stubbed transport runs (two concurrency tests waited for it forever).
+OFFLINE_TOKENIZER = tiktoken.Encoding(
+    "offline_bytes",
+    pat_str=r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""",
+    mergeable_ranks={bytes([i]): i for i in range(256)},
+    special_tokens={"<|endoftext|>": 256},
+)
 
 
 @pytest.fixture(autouse=True)
 def isolate_unit_services(monkeypatch):
-    from xf_embed import api, cache
+    from xf_embed import api, cache, embeddings
 
     original_connect = socket.socket.connect
 
@@ -18,6 +30,7 @@ def isolate_unit_services(monkeypatch):
         return original_connect(sock, address)
 
     monkeypatch.setattr(socket.socket, "connect", offline_connect)
+    monkeypatch.setattr(embeddings, "_tokenizer", OFFLINE_TOKENIZER)
     monkeypatch.setattr(api, "get_db_pool", AsyncMock(side_effect=RuntimeError("offline unit test")))
     monkeypatch.setattr(api, "get_faiss_index", AsyncMock(return_value=None))
     monkeypatch.setattr(api, "get_es_client", lambda: type("OfflineES", (), {"ping": AsyncMock(return_value=False)})())

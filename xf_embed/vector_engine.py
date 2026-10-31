@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import tempfile
@@ -97,6 +98,9 @@ async def build_faiss_index(
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
     pool = await get_db_pool()
+    from xf_embed.db import db_unix_now
+
+    build_started = await db_unix_now(pool)
     dimension = settings.OPENAI_DIMENSIONS
     index = create_base_faiss_index(dimension)
 
@@ -128,6 +132,7 @@ async def build_faiss_index(
             logger.info(f"Indexed {total_added} vectors (latest DB id: {last_id})...")
 
     await asyncio.to_thread(save_faiss_index, index, save_path)
+    await asyncio.to_thread(write_index_state, save_path, build_started - STATE_MARGIN_S, index.ntotal)
     async with _index_lock:
         _faiss_index = index
 
@@ -135,22 +140,54 @@ async def build_faiss_index(
     return index
 
 
-def indexed_max_id(index: faiss.Index) -> int:
-    """Highest record id an IndexIDMap/IndexIDMap2 holds (0 when empty)."""
-    ids = faiss.vector_to_array(index.id_map)
-    return int(ids.max()) if ids.size else 0
+# A change committed a little after the watermark was read still carries a last_updated just before
+# it (the value is set when the statement runs, not when it commits), so each run looks back this far.
+STATE_MARGIN_S = 900
+
+
+def index_state_path(path: Optional[str] = None) -> Path:
+    return Path(str(path or settings.FAISS_INDEX_PATH) + ".state.json")
+
+
+def read_index_state(path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    try:
+        state = json.loads(index_state_path(path).read_text())
+        return state if isinstance(state.get("since"), int) else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def write_index_state(path: Optional[str], since: int, ntotal: int) -> None:
+    """Record the database time from which the next delta must look for changed rows."""
+    target = index_state_path(path)
+    temporary = target.with_name(target.name + ".tmp")
+    temporary.write_text(json.dumps({"since": int(since), "ntotal": int(ntotal)}) + "\n")
+    os.chmod(temporary, 0o644)
+    os.replace(temporary, target)
+
+
+def supports_removal(index: faiss.Index) -> bool:
+    """IndexIDMap2 over a flat index can drop vectors in place; HNSW graphs cannot."""
+    inner = getattr(index, "index", None)
+    return inner is not None and isinstance(faiss.downcast_index(inner), faiss.IndexFlat)
 
 
 async def update_faiss_index_delta(
     batch_size: int = 10000,
     path: Optional[str] = None,
-    progress_callback: Optional[Any] = None,
-) -> tuple:
+    since: Optional[int] = None,
+) -> Dict[str, Any]:
     """
-    Add the embeddings written since the index on disk was built: rows whose id is above the
-    highest id the index holds. Rows are append-only (AUTO_INCREMENT), so this is the whole delta
-    for new posts; a re-embedded row keeps its old vector until the next full `index-faiss`.
-    Saves atomically only when something was added. Returns (previous max id, vectors added).
+    Bring the index on disk up to date with openai_embeddings without a full rebuild:
+    - rows in the table but not in the index are added (new rows, including ones that committed
+      out of id order);
+    - ids in the index that are no longer in the table are removed (deleted posts and threads);
+    - rows changed since the last build or delta (last_updated) are removed and re-added with their
+      current vector (in-place re-embedding).
+    The change watermark comes from the state file written next to the index by every build and
+    delta; `since` (a unix time) overrides it. Without either it falls back to the index file's
+    mtime, which cannot see re-embeddings older than that write.
+    Saves the index atomically only when it changed, then advances the state.
     """
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
@@ -158,30 +195,60 @@ async def update_faiss_index_delta(
     index = await asyncio.to_thread(load_faiss_index_from_disk, filepath)
     if index is None:
         raise RuntimeError(f"no FAISS index at {filepath}; run index-faiss for a full build first")
-    start_id = await asyncio.to_thread(indexed_max_id, index)
-    last_id, added = start_id, 0
+
+    from xf_embed.db import db_unix_now, fetch_embedding_ids, fetch_embeddings_by_ids, fetch_ids_updated_since
+
     pool = await get_db_pool()
+    run_started = await db_unix_now(pool)
+    if since is None:
+        state = read_index_state(filepath)
+        if state is not None:
+            since = state["since"]
+        else:
+            since = int(os.path.getmtime(filepath)) - STATE_MARGIN_S
+            logger.warning(
+                f"FAISS delta: no state file for {filepath}; looking for changed rows since the index "
+                f"file's mtime. Re-embeddings older than that need a full index-faiss rebuild."
+            )
 
-    from xf_embed.db import fetch_embeddings_batch
+    indexed = await asyncio.to_thread(lambda: np.unique(faiss.vector_to_array(index.id_map).astype(np.int64)))
+    in_table = np.unique(await fetch_embedding_ids(pool))
+    stale = np.setdiff1d(indexed, in_table, assume_unique=True)
+    missing = np.setdiff1d(in_table, indexed, assume_unique=True)
+    changed = np.intersect1d(np.unique(await fetch_ids_updated_since(pool, since)), indexed, assume_unique=True)
+    changed = np.setdiff1d(changed, stale, assume_unique=True)
 
-    while True:
-        record_ids, _, _, vectors, next_last_id = await fetch_embeddings_batch(
-            pool=pool, last_id=last_id, batch_size=batch_size,
-        )
-        if next_last_id <= last_id:
-            break
-        last_id = next_last_id
-        if not record_ids:
-            continue
-        await asyncio.to_thread(_add_embeddings, index, vectors, record_ids)
-        added += len(record_ids)
-        if progress_callback:
-            progress_callback(len(record_ids), added)
+    to_remove = np.union1d(stale, changed)
+    if to_remove.size and not supports_removal(index):
+        raise RuntimeError("this FAISS index type cannot remove vectors; run index-faiss for a full rebuild")
+    if to_remove.size:
+        await asyncio.to_thread(index.remove_ids, np.ascontiguousarray(to_remove, dtype=np.int64))
 
-    if added:
+    changed_set = set(changed.tolist())
+    added = updated = 0
+    refetch = np.union1d(missing, changed)
+    for offset in range(0, refetch.size, batch_size):
+        chunk = refetch[offset:offset + batch_size].tolist()
+        record_ids, _, _, vectors, _ = await fetch_embeddings_by_ids(pool, chunk)
+        if record_ids:
+            await asyncio.to_thread(_add_embeddings, index, vectors, record_ids)
+            n_updated = sum(1 for rid in record_ids if rid in changed_set)
+            updated += n_updated
+            added += len(record_ids) - n_updated
+    # A changed row whose new vector is invalid stays removed; a new invalid row is skipped and
+    # looked at again next run. fetch_embeddings_batch skips the same rows on a full build.
+    invalid = int(refetch.size) - added - updated
+
+    if to_remove.size or added or updated:
         await asyncio.to_thread(save_faiss_index, index, filepath)
-    logger.info(f"FAISS delta: {added} vectors added after id {start_id} (index now {index.ntotal}).")
-    return start_id, added
+    new_since = run_started - STATE_MARGIN_S
+    await asyncio.to_thread(write_index_state, filepath, new_since, index.ntotal)
+    result = {
+        "added": added, "updated": updated, "removed": int(stale.size), "invalid": invalid,
+        "since": int(since), "next_since": int(new_since), "ntotal": int(index.ntotal),
+    }
+    logger.info(f"FAISS delta: {result}")
+    return result
 
 
 async def search_faiss(
