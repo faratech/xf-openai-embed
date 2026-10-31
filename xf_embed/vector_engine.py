@@ -135,6 +135,55 @@ async def build_faiss_index(
     return index
 
 
+def indexed_max_id(index: faiss.Index) -> int:
+    """Highest record id an IndexIDMap/IndexIDMap2 holds (0 when empty)."""
+    ids = faiss.vector_to_array(index.id_map)
+    return int(ids.max()) if ids.size else 0
+
+
+async def update_faiss_index_delta(
+    batch_size: int = 10000,
+    path: Optional[str] = None,
+    progress_callback: Optional[Any] = None,
+) -> tuple:
+    """
+    Add the embeddings written since the index on disk was built: rows whose id is above the
+    highest id the index holds. Rows are append-only (AUTO_INCREMENT), so this is the whole delta
+    for new posts; a re-embedded row keeps its old vector until the next full `index-faiss`.
+    Saves atomically only when something was added. Returns (previous max id, vectors added).
+    """
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    filepath = path or settings.FAISS_INDEX_PATH
+    index = await asyncio.to_thread(load_faiss_index_from_disk, filepath)
+    if index is None:
+        raise RuntimeError(f"no FAISS index at {filepath}; run index-faiss for a full build first")
+    start_id = await asyncio.to_thread(indexed_max_id, index)
+    last_id, added = start_id, 0
+    pool = await get_db_pool()
+
+    from xf_embed.db import fetch_embeddings_batch
+
+    while True:
+        record_ids, _, _, vectors, next_last_id = await fetch_embeddings_batch(
+            pool=pool, last_id=last_id, batch_size=batch_size,
+        )
+        if next_last_id <= last_id:
+            break
+        last_id = next_last_id
+        if not record_ids:
+            continue
+        await asyncio.to_thread(_add_embeddings, index, vectors, record_ids)
+        added += len(record_ids)
+        if progress_callback:
+            progress_callback(len(record_ids), added)
+
+    if added:
+        await asyncio.to_thread(save_faiss_index, index, filepath)
+    logger.info(f"FAISS delta: {added} vectors added after id {start_id} (index now {index.ntotal}).")
+    return start_id, added
+
+
 async def search_faiss(
     query_vector: np.ndarray,
     top_k: int = 10,

@@ -79,6 +79,29 @@ def index_faiss(
 
 
 @app.command()
+def index_faiss_delta(
+    batch_size: int = typer.Option(10000, min=1, help="Batch size for fetching vectors from MySQL"),
+    output_path: Optional[str] = typer.Option(None, help="FAISS index file to update in place"),
+):
+    """Add the embeddings written since the index was built (no full rebuild, no API calls)."""
+    from xf_embed.vector_engine import update_faiss_index_delta
+    from xf_embed.config import settings
+
+    target_path = output_path or settings.FAISS_INDEX_PATH
+    start_time = time.time()
+
+    async def run():
+        try:
+            return await update_faiss_index_delta(batch_size=batch_size, path=target_path)
+        finally:
+            await _close_clients()
+
+    start_id, added = asyncio.run(run())
+    # Machine-readable last line for the cron wrapper: it restarts the service only when added > 0.
+    console.print(f"FAISS_DELTA after_id={start_id} added={added} seconds={time.time() - start_time:.1f}")
+
+
+@app.command()
 def search(
     query: str = typer.Argument(..., help="Search query string"),
     mode: SearchMode = typer.Option(SearchMode.hybrid, help="Search mode: 'hybrid', 'vector', or 'elastic'"),
