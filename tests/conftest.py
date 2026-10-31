@@ -6,6 +6,22 @@ from unittest.mock import AsyncMock
 import pytest
 
 
+@pytest.fixture
+def offline_tokenizer(monkeypatch):
+    import tiktoken
+    from xf_embed import embeddings
+
+    # Exercise real encode/decode and special-token handling without a BPE download.
+    tokenizer = tiktoken.Encoding(
+        name="unit-test-bytes",
+        pat_str=r"(?s).",
+        mergeable_ranks={bytes([value]): value for value in range(256)},
+        special_tokens={"<|endoftext|>": 256},
+    )
+    monkeypatch.setattr(embeddings, "get_tokenizer", lambda: tokenizer)
+    return tokenizer
+
+
 @pytest.fixture(autouse=True)
 def isolate_unit_services(monkeypatch):
     from xf_embed import api, cache

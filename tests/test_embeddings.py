@@ -10,11 +10,11 @@ def test_normalize_vector():
     assert np.isclose(normed[1], 0.8)
 
 
-def test_count_tokens_and_truncate():
+def test_count_tokens_and_truncate(offline_tokenizer):
     text = "Hello world! This is a test string."
     tok_count = count_tokens(text)
-    assert tok_count > 0
+    assert tok_count == len(text.encode("utf-8"))
 
     truncated = truncate_text(text, max_tokens=3)
-    assert len(truncated) <= len(text)
+    assert truncated == "Hel"
     assert count_tokens(truncated) <= 3
