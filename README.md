@@ -265,6 +265,9 @@ python -m pytest -v tests/
 Tests stub services and forbid network connections. They do not need a running
 database, Elasticsearch, Redis, or an OpenAI API key. PHP regression tests use
 fake cURL functions with the real extension disabled.
+Embedding unit tests use an in-memory byte-level tiktoken encoding, including a
+special token, so a populated tiktoken cache is not required. These tests cover
+token handling, not the production model's vocabulary or token counts.
 
 ---
 

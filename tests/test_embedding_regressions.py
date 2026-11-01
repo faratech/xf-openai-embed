@@ -7,6 +7,8 @@ import pytest
 
 from xf_embed import embeddings
 
+pytestmark = pytest.mark.usefixtures("offline_tokenizer")
+
 
 def test_literal_special_tokens_are_ordinary_user_text():
     text = 'literal <|endoftext|> from a forum post'
@@ -72,7 +74,7 @@ def test_identical_embedding_misses_share_work_and_cancellation(monkeypatch):
             return np.ones(1536, dtype=np.float32)
         monkeypatch.setattr(embeddings, '_generate_via_local_service', generate)
         tasks = [asyncio.create_task(embeddings.generate_embedding('cold query', normalize=False)) for _ in range(12)]
-        await started.wait()
+        await asyncio.wait_for(started.wait(), timeout=5)
         tasks[0].cancel()
         with pytest.raises(asyncio.CancelledError):
             await tasks[0]
@@ -111,7 +113,7 @@ def test_shutdown_cancels_shielded_embedding_before_closing_cache(monkeypatch):
         monkeypatch.setattr(api, 'close_es_client', AsyncMock())
         async with api.lifespan(api.create_app()):
             caller = asyncio.create_task(embeddings.generate_embedding('shutdown race', normalize=False))
-            await started.wait()
+            await asyncio.wait_for(started.wait(), timeout=5)
             caller.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await caller
