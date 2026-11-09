@@ -49,3 +49,4 @@ htmlcov/
 
 # Agent guidance stays on the server, not in this public repository (operator decision 2026-10-31)
 CLAUDE.md
+.claude/settings.local.json
